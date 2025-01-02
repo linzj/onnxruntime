@@ -38,7 +38,6 @@ std::string SetChannelAndBatchIndices(
 
   return result.str();
 }
-}  // namespace
 
 // Helper functions to convert strings to enums
 CoordinateTransformMode ParseCoordinateTransformMode(const std::string& mode_str) {
@@ -137,6 +136,108 @@ ResizeAttributes ParseResizeAttributes(const OpKernelInfo& info) {
 
   return attrs;
 }
+
+std::vector<float> UpdateRoI(const std::vector<float>& roi, const std::vector<int64_t>& axes, size_t rank) {
+  std::vector<float> roi_temp(rank * 2, 0);                     // Create a vector with 'rank' 0's followed by 'rank' 1's
+  std::vector<float> roi_local = roi.empty() ? roi_temp : roi;  // If roi is empty, use roiTmp, otherwise copy roi
+
+  if (!axes.empty()) {
+    for (size_t i = 0; i < axes.size(); ++i) {
+      int64_t v = axes[i];
+      roi_temp[v] = roi_local[i];
+      roi_temp[i + rank] = roi_local[axes.size() + i];
+    }
+    return roi_temp;
+  }
+
+  return roi_local;
+}
+
+std::vector<int64_t> InitOutputShape(const gsl::span<const int64_t>& input_shape,
+                                     const std::vector<float>& scales,
+                                     const std::vector<int64_t>& sizes,
+                                     const std::vector<int64_t>& axes) {
+  std::vector<int64_t> output_shape;
+
+  if (!sizes.empty()) {
+    if (!axes.empty()) {
+      // Copy inputShape into outputShape
+      output_shape.insert(output_shape.end(), input_shape.begin(), input_shape.end());
+
+      // Check that axes is not out of bounds
+      if (static_cast<size_t>(*std::max_element(axes.begin(), axes.end())) > input_shape.size()) {
+        throw std::out_of_range("axes is out of bound");
+      }
+
+      // Set values in outputShape based on axes and sizes
+      for (size_t i = 0; i < axes.size(); ++i) {
+        output_shape[axes[i]] = sizes[i];
+      }
+    } else {
+      // Just copy sizes into outputShape
+      output_shape = sizes;
+    }
+  } else {
+    if (scales.empty()) {
+      throw std::invalid_argument("Resize requires either scales or sizes.");
+    } else {
+      // Scale inputShape using scales and round the values
+      for (size_t i = 0; i < input_shape.size(); ++i) {
+        output_shape.push_back(std::round(input_shape[i] * scales[i]));
+      }
+    }
+  }
+
+  return output_shape;
+}
+
+std::vector<int64_t> AdjustOutputShape(const gsl::span<const int64_t>& input_shape,
+                                       std::vector<float>& scales,
+                                       const ResizeAttributes& attributes) {
+  // Define a lambda for scale in policy based on the provided `keepAspectRatioPolicy`
+  float scale_in_policy = [&]() -> float {
+    if (attributes.keepAspectRatioPolicy == KeepAspectRatioPolicy::NotLarger) {
+      if (!attributes.axes.empty()) {
+        return *std::min_element(attributes.axes.begin(), attributes.axes.end(),
+                                 [&](int i, int j) { return scales[i] < scales[j]; });
+      } else {
+        return *std::min_element(scales.begin(), scales.end());
+      }
+    } else if (attributes.keepAspectRatioPolicy == KeepAspectRatioPolicy::NotSmaller) {
+      if (!attributes.axes.empty()) {
+        return *std::max_element(attributes.axes.begin(), attributes.axes.end(),
+                                 [&](int i, int j) { return scales[i] < scales[j]; });
+      } else {
+        return *std::max_element(scales.begin(), scales.end());
+      }
+    } else {
+      throw std::invalid_argument("Keep aspect ratio policy " + ResizeProgram::KeepAspectRatioPolicyToWGSL(attributes.keepAspectRatioPolicy) + " is not supported");
+    }
+  }();
+
+  // Reset scales to 1.0 for all dimensions
+  std::fill(scales.begin(), scales.end(), 1.0f);
+
+  std::vector<int64_t> adjustedOutputShape(input_shape.begin(), input_shape.end());
+
+  if (!attributes.axes.empty()) {
+    // Set scale in policy for each axis in axes
+    for (size_t i = 0; i < attributes.axes.size(); ++i) {
+      scales[attributes.axes[i]] = scale_in_policy;
+      adjustedOutputShape[attributes.axes[i]] = std::round(input_shape[attributes.axes[i]] * scales[attributes.axes[i]]);
+    }
+  } else {
+    // Set all scales to scaleInPolicy if no axes are provided
+    std::fill(scales.begin(), scales.end(), scale_in_policy);
+    for (size_t i = 0; i < input_shape.size(); ++i) {
+      adjustedOutputShape[i] = std::round(input_shape[i] * scales[i]);
+    }
+  }
+
+  return adjustedOutputShape;
+};
+
+}  // namespace
 
 ResizeProgram::ResizeProgram() : Program("Resize", ProgramMetadata()) {}
 
@@ -349,14 +450,10 @@ Status ResizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
   const ShaderVariableHelper& input = shader.AddInput("input", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias);
   const ShaderVariableHelper& output = shader.AddOutput("output", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias);
 
-  // Define type aliases as per ShaderVariableHelper conventions
-  // For example, "input_value_t" and "input_indices_t" are assumed to be defined elsewhere based on the usage flags
-  // Similarly, "output_value_t" and "output_indices_t" are defined for the output variable
-
   // Initialize a string stream to build additional WGSL implementations
   std::stringstream additional_impl;
 
-  // 1. Define getOriginalCoordinateFromResizedCoordinate function
+  // Define getOriginalCoordinateFromResizedCoordinate function
   additional_impl << "fn getOriginalCoordinateFromResizedCoordinate(xResized: u32, xScale: f32, lengthResized: u32, "
                   << "lengthOriginal: u32, roiStart: f32, roiEnd: f32) -> f32 {\n";  // Returning f32 as per input_value_t
   switch (attributes_.coordinateTransformMode) {
@@ -406,7 +503,7 @@ Status ResizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
   }
   additional_impl << "}\n\n";
 
-  // 2. Define getNearestPixelFromOriginal function
+  // Define getNearestPixelFromOriginal function
   additional_impl << "fn getNearestPixelFromOriginal(xOriginal: f32, isDownSample: bool) -> f32 {\n";
   switch (attributes_.nearestMode) {
     case NearestMode::RoundPreferFloor:
@@ -445,8 +542,7 @@ Status ResizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
   }
   additional_impl << "}\n\n";
 
-  // 3. Define calculateOriginalIndicesFromOutputIndices function
-  // Use "output_indices_t" as per type alias convention
+  // Define calculateOriginalIndicesFromOutputIndices function
   size_t output_shape_length = attributes_.output_shape.NumDimensions();
   size_t input_shape_length = attributes_.input_shape.NumDimensions();
   bool is_f16 = attributes_.input_is_fp16;
@@ -471,8 +567,7 @@ Status ResizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
                   << "  return original_indices;\n"
                   << "}\n";
 
-  // 4. Define calculateInputIndicesFromOutputIndices function
-  // Use "input_indices_t" as per type alias convention
+  // Define calculateInputIndicesFromOutputIndices function
   additional_impl << "fn calculateInputIndicesFromOutputIndices(output_indices: output_indices_t) -> input_indices_t {\n"
                   << "  var input_indices: input_indices_t;\n"
                   << "  for (var i: u32 = 0u; i < " << output_shape_length << "; i++) {\n"
@@ -507,7 +602,7 @@ Status ResizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
                   << "  return input_indices;\n"
                   << "}";
 
-  // 5. Define checkInputIndices function
+  // Define checkInputIndices function
   additional_impl << "fn checkInputIndices(input_indices: input_indices_t) -> bool {\n"
                   << "  for (var i: u32 = 0u; i < " << output_shape_length << "u; i = i + 1u) {\n"
                   << "  var input_index = ${input.indicesGet('input_indices', 'i')};\n"
@@ -520,7 +615,7 @@ Status ResizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
                   << "return true;\n"
                   << "}\n\n";
 
-  // 6. Define interpolation functions based on mode
+  // Define interpolation functions based on mode
   if (attributes_.mode == Mode::Linear) {
     if (input_shape_length == 2 || input_shape_length == 4) {
       constexpr const bool is_nchw = true;
@@ -805,6 +900,7 @@ Status Resize::ComputeInternal(ComputeContext& context) const {
   std::vector<float> scales;
   std::vector<int64_t> sizes;
   std::vector<float> roi;
+  std::vector<int64_t> output_shape;
 
   // Extract opset version from custom data buffer
   int opsetVersion;
@@ -813,139 +909,34 @@ Status Resize::ComputeInternal(ComputeContext& context) const {
   // Validate inputs and populate scales, sizes, roi
   try {
     ValidateInputs(context, attributes_, opsetVersion, scales, sizes, roi);
+    // Determine output shape using the provided lambdas
+    const auto& input_dims = input_tensor->Shape().GetDims();
+
+    // Initialize the ROI using the updateRoI lambda
+    roi = UpdateRoI(attributes_.roi, attributes_.axes, input_dims.size());
+
+    // Initialize the output shape using the initOutputShape lambda
+    output_shape = InitOutputShape(input_dims, attributes_.scales, sizes, attributes_.axes);
+    scales = attributes_.scales;
+
+    if (attributes_.scales.empty()) {
+      // Calculate scales if not provided
+      scales.resize(input_dims.size());
+      for (size_t i = 0; i < input_dims.size(); ++i) {
+        scales[i] = (input_dims[i] == 0 ? 1.0f : static_cast<float>(output_shape[i]) / input_dims[i]);
+      }
+
+      if (attributes_.keepAspectRatioPolicy != KeepAspectRatioPolicy::Stretch) {
+        // Adjust output shape based on keepAspectRatioPolicy
+        output_shape = AdjustOutputShape(input_dims, scales, attributes_);
+      }
+    }
   } catch (const std::exception& ex) {
     return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, ex.what());
   }
-  auto updateRoI = [](const std::vector<float>& roi, const std::vector<int64_t>& axes, size_t rank) -> std::vector<float> {
-    std::vector<float> roiTmp(rank * 2, 0);                    // Create a vector with 'rank' 0's followed by 'rank' 1's
-    std::vector<float> roiLocal = roi.empty() ? roiTmp : roi;  // If roi is empty, use roiTmp, otherwise copy roi
 
-    if (!axes.empty()) {
-      for (size_t i = 0; i < axes.size(); ++i) {
-        int64_t v = axes[i];
-        roiTmp[v] = roiLocal[i];
-        roiTmp[i + rank] = roiLocal[axes.size() + i];
-      }
-      return roiTmp;
-    }
-
-    return roiLocal;
-  };
-
-  auto initOutputShape = [](const gsl::span<const int64_t>& inputShape,
-                            const std::vector<float>& scales,
-                            const std::vector<int64_t>& sizes,
-                            const std::vector<int64_t>& axes) -> std::vector<int64_t> {
-    std::vector<int64_t> outputShape;
-
-    if (!sizes.empty()) {
-      if (!axes.empty()) {
-        // Copy inputShape into outputShape
-        outputShape.insert(outputShape.end(), inputShape.begin(), inputShape.end());
-
-        // Check that axes is not out of bounds
-        if (static_cast<size_t>(*std::max_element(axes.begin(), axes.end())) > inputShape.size()) {
-          throw std::out_of_range("axes is out of bound");
-        }
-
-        // Set values in outputShape based on axes and sizes
-        for (size_t i = 0; i < axes.size(); ++i) {
-          outputShape[axes[i]] = sizes[i];
-        }
-      } else {
-        // Just copy sizes into outputShape
-        outputShape = sizes;
-      }
-    } else {
-      if (scales.empty()) {
-        throw std::invalid_argument("Resize requires either scales or sizes.");
-      } else {
-        // Scale inputShape using scales and round the values
-        for (size_t i = 0; i < inputShape.size(); ++i) {
-          outputShape.push_back(std::round(inputShape[i] * scales[i]));
-        }
-      }
-    }
-
-    return outputShape;
-  };
-  auto adjustOutputShape = [](const gsl::span<const int64_t>& inputShape,
-                              std::vector<float>& scales,
-                              const ResizeAttributes& attributes) -> std::vector<int64_t> {
-    // Define a lambda for scale in policy based on the provided `keepAspectRatioPolicy`
-    float scaleInPolicy = [&]() -> float {
-      if (attributes.keepAspectRatioPolicy == KeepAspectRatioPolicy::NotLarger) {
-        if (!attributes.axes.empty()) {
-          return *std::min_element(attributes.axes.begin(), attributes.axes.end(),
-                                   [&](int i, int j) { return scales[i] < scales[j]; });
-        } else {
-          return *std::min_element(scales.begin(), scales.end());
-        }
-      } else if (attributes.keepAspectRatioPolicy == KeepAspectRatioPolicy::NotSmaller) {
-        if (!attributes.axes.empty()) {
-          return *std::max_element(attributes.axes.begin(), attributes.axes.end(),
-                                   [&](int i, int j) { return scales[i] < scales[j]; });
-        } else {
-          return *std::max_element(scales.begin(), scales.end());
-        }
-      } else {
-        throw std::invalid_argument("Keep aspect ratio policy " + ResizeProgram::KeepAspectRatioPolicyToWGSL(attributes.keepAspectRatioPolicy) + " is not supported");
-      }
-    }();
-
-    // Reset scales to 1.0 for all dimensions
-    std::fill(scales.begin(), scales.end(), 1.0f);
-
-    std::vector<int64_t> adjustedOutputShape = inputShape;
-
-    if (!attributes.axes.empty()) {
-      // Set scale in policy for each axis in axes
-      for (size_t i = 0; i < attributes.axes.size(); ++i) {
-        scales[attributes.axes[i]] = scaleInPolicy;
-        adjustedOutputShape[attributes.axes[i]] = std::round(inputShape[attributes.axes[i]] * scales[attributes.axes[i]]);
-      }
-    } else {
-      // Set all scales to scaleInPolicy if no axes are provided
-      std::fill(scales.begin(), scales.end(), scaleInPolicy);
-      for (size_t i = 0; i < inputShape.size(); ++i) {
-        adjustedOutputShape[i] = std::round(inputShape[i] * scales[i]);
-      }
-    }
-
-    return adjustedOutputShape;
-  };
-
-  // Determine output shape using the provided lambdas
-  std::vector<int64_t> output_dims;
-  const auto& input_dims = input_tensor->Shape().GetDims();
-
-  // Initialize the ROI using the updateRoI lambda
-  roi = updateRoI(attributes_.roi, attributes_.axes, input_dims.size());
-
-  // Initialize the output shape using the initOutputShape lambda
-  std::vector<int64_t> output_shape = initOutputShape(input_dims, attributes_.scales, sizes, attributes_.axes);
-  scales = attributes_.scales;
-
-  if (attributes_.scales.empty()) {
-    // Calculate scales if not provided
-    scales.resize(input_dims.size());
-    for (size_t i = 0; i < input_dims.size(); ++i) {
-      scales[i] = (input_dims[i] == 0 ? 1.0f : static_cast<float>(output_shape[i]) / input_dims[i]);
-    }
-
-    if (attributes_.keepAspectRatioPolicy != KeepAspectRatioPolicy::Stretch) {
-      // Adjust output shape based on keepAspectRatioPolicy
-      output_shape = adjustOutputShape(input_dims, scales, attributes_);
-    }
-  }
-
-  // Assign output dimensions based on the output_shape and scales
-  output_dims.resize(input_dims.size());
-  for (size_t i = 0; i < input_dims.size(); ++i) {
-    output_dims[i] = static_cast<int64_t>(std::round(input_dims[i] * scales[i]));
-  }
   // Create output tensor
-  TensorShape output_shape_obj(output_dims);
+  TensorShape output_shape_obj(output_shape);
   Tensor* output_tensor = context.Output(0, output_shape_obj);
   if (output_tensor == nullptr) {
     return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Output tensor is null");
