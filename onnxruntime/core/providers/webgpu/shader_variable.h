@@ -39,6 +39,19 @@ std::string GetElementAt(std::string_view var, const TIdx& idx, TRank rank, bool
   return rank > 1 ? MakeStringWithClassicLocale(var, "[", idx, "]") : std::string{var};
 }
 
+template <typename TRank,
+          typename = std::enable_if_t<std::is_same_v<TRank, int> || std::is_same_v<TRank, size_t>>>
+std::string GetElementAt(std::string_view& var, std::string_view& idx, TRank rank, bool is_f16 = false) {
+  if (var.find("uniforms.") == 0 && rank > 4) {
+    if (is_f16) {
+      return MakeStringWithClassicLocale(var, "[(", idx, ") / 8][(", idx, ") % 8 / 4][(", idx, ") % 8 % 4]");
+    } else {
+      return MakeStringWithClassicLocale(var, "[(", idx, ") / 4][(", idx, ") % 4]");
+    }
+  }
+  return rank > 1 ? MakeStringWithClassicLocale(var, "[", idx, "]") : std::string{var};
+}
+
 struct ShaderUsage {
   enum : uint32_t {
     None = 0,                             // no usage. this means no additional implementation code will be generated.

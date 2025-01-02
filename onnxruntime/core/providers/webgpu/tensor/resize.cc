@@ -3,11 +3,42 @@
 
 #include <algorithm>
 #include <cmath>
-#include <sstream>
+#include <tuple>
 #include "core/providers/webgpu/shader_helper.h"
+
+namespace std {
+template <typename T>
+struct hash<std::vector<T>> {
+  size_t operator()(const std::vector<T>& vec) const {
+    size_t seed = vec.size();  // Start with the size of the vector
+    for (const auto& element : vec) {
+      // Combine the hash of each element with the seed
+      seed ^= std::hash<T>{}(element) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+    }
+    return seed;
+  }
+};
+}  // namespace std
 
 namespace onnxruntime {
 namespace webgpu {
+namespace {
+std::string SetChannelAndBatchIndices(
+    const ShaderIndicesHelper& input,
+    int channel_idx,
+    int batch_idx,
+    int special_dims) {
+  std::ostringstream result;
+
+  if (input.Rank() > special_dims) {
+    // Assuming indicesSet is a function in ShaderIndicesHelper
+    result << input.IndicesSet("input_indices", channel_idx, "channel") << ";\n";
+    result << input.IndicesSet("input_indices", batch_idx, "batch") << ";\n";
+  }
+
+  return result.str();
+}
+}  // namespace
 
 // Helper functions to convert strings to enums
 CoordinateTransformMode ParseCoordinateTransformMode(const std::string& mode_str) {
@@ -77,6 +108,9 @@ ResizeAttributes ParseResizeAttributes(const OpKernelInfo& info) {
   // Parse antialias
   attrs.antialias = info.GetAttrOrDefault<int>("antialias", 0);
 
+  // Parse optset
+  attrs.opset = info.node().SinceVersion();
+
   // Parse axes
   attrs.axes = info.GetAttrsOrDefault<int64_t>("axes");
 
@@ -103,6 +137,8 @@ ResizeAttributes ParseResizeAttributes(const OpKernelInfo& info) {
 
   return attrs;
 }
+
+ResizeProgram::ResizeProgram() : Program("Resize", ProgramMetadata()) {}
 
 // Helper function to validate scales
 void Resize::ValidateScales(const std::vector<float>& scales, const ResizeAttributes& attributes) const {
@@ -240,7 +276,7 @@ void Resize::ValidateInputs(const ComputeContext& context,
 }
 
 // ResizeProgram: Utility function implementations
-std::string ResizeProgram::CoordinateTransformModeToWGSL(CoordinateTransformMode mode) const {
+std::string ResizeProgram::CoordinateTransformModeToWGSL(CoordinateTransformMode mode) {
   switch (mode) {
     case CoordinateTransformMode::HalfPixel:
       return "half_pixel";
@@ -261,7 +297,7 @@ std::string ResizeProgram::CoordinateTransformModeToWGSL(CoordinateTransformMode
   }
 }
 
-std::string ResizeProgram::KeepAspectRatioPolicyToWGSL(KeepAspectRatioPolicy policy) const {
+std::string ResizeProgram::KeepAspectRatioPolicyToWGSL(KeepAspectRatioPolicy policy) {
   switch (policy) {
     case KeepAspectRatioPolicy::Stretch:
       return "stretch";
@@ -274,7 +310,7 @@ std::string ResizeProgram::KeepAspectRatioPolicyToWGSL(KeepAspectRatioPolicy pol
   }
 }
 
-std::string ResizeProgram::ModeToWGSL(Mode mode) const {
+std::string ResizeProgram::ModeToWGSL(Mode mode) {
   switch (mode) {
     case Mode::Nearest:
       return "nearest";
@@ -287,7 +323,7 @@ std::string ResizeProgram::ModeToWGSL(Mode mode) const {
   }
 }
 
-std::string ResizeProgram::NearestModeToWGSL(NearestMode mode, int opset_version) const {
+std::string ResizeProgram::NearestModeToWGSL(NearestMode mode, int opset_version) {
   switch (mode) {
     case NearestMode::RoundPreferFloor:
       return "round_prefer_floor";
@@ -309,183 +345,453 @@ std::string ResizeProgram::NearestModeToWGSL(NearestMode mode, int opset_version
 
 // ResizeProgram: GenerateShaderCode implementation
 Status ResizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
-  // Register uniforms
-  const ShaderVariableHelper& output_size = shader.AddInput("ouput_size");
-  const ShaderVariableHelper& scales = shader.AddInput("scales");
-  const ShaderVariableHelper& roi = shader.AddInput("roi");
+  // Declare input and output variables using ShaderVariableHelper with appropriate usage flags
+  const ShaderVariableHelper& input = shader.AddInput("input", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias);
+  const ShaderVariableHelper& output = shader.AddOutput("output", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias);
 
-  // Declare input and output variables
-  const ShaderVariableHelper& input = shader.AddInput("input");
-  const ShaderVariableHelper& output = shader.AddOutput("output");
+  // Define type aliases as per ShaderVariableHelper conventions
+  // For example, "input_value_t" and "input_indices_t" are assumed to be defined elsewhere based on the usage flags
+  // Similarly, "output_value_t" and "output_indices_t" are defined for the output variable
 
-  // Begin shader code generation
-  std::ostringstream ss;
+  // Initialize a string stream to build additional WGSL implementations
+  std::stringstream additional_impl;
 
-  // Define getOriginalCoordinateFromResizedCoordinate function
-  shader.MainFunctionBody() << shader.GuardAgainstOutOfBoundsWorkgroupSizes("uniforms.output_size");
-  bool noScale = Inputs()[0].tensor->Shape() == Outputs()[0].tensor->Shape();
-  ss << "fn getOriginalCoordinateFromResizedCoordinate(xResized: u32, xScale: f32, lengthResized: u32, lengthOriginal: u32, roiStart: f32, roiEnd: f32) -> f32 {\n";
+  // 1. Define getOriginalCoordinateFromResizedCoordinate function
+  additional_impl << "fn getOriginalCoordinateFromResizedCoordinate(xResized: u32, xScale: f32, lengthResized: u32, "
+                  << "lengthOriginal: u32, roiStart: f32, roiEnd: f32) -> f32 {\n";  // Returning f32 as per input_value_t
   switch (attributes_.coordinateTransformMode) {
     case CoordinateTransformMode::Asymmetric:
-      ss << "  return f32(xResized) / xScale;\n";
+      additional_impl << "  return f32(xResized) / f32(xScale);\n";
       break;
     case CoordinateTransformMode::PyTorchHalfPixel:
-      ss << "  if (lengthResized > 1u) {\n"
-         << "    return (f32(xResized) + 0.5) / xScale - 0.5;\n"
-         << "  } else {\n"
-         << "    return 0.0;\n"
-         << "  }\n";
+      additional_impl << "  if (lengthResized > 1) {\n"
+                      << "    return (f32(xResized) + 0.5) / f32(xScale) - 0.5;\n"
+                      << "  } else {\n"
+                      << "    return 0.0;\n"
+                      << "  }\n";
       break;
     case CoordinateTransformMode::TfHalfPixelForNN:
-      ss << "  return (f32(xResized) + 0.5) / xScale;\n";
+      additional_impl << "  return (f32(xResized) + 0.5) / f32(xScale);\n";
       break;
     case CoordinateTransformMode::AlignCorners:
-      ss << "  if (lengthResized == 1u) {\n"
-         << "    return 0.0;\n"
-         << "  } else {\n"
-         << "    let whole = f32(xResized * (lengthOriginal - 1u) / (lengthResized - 1u));\n"
-         << "    let fract = f32(xResized * (lengthOriginal - 1u) % (lengthResized - 1u)) / f32(lengthResized - 1u);\n"
-         << "    return whole + fract;\n"
-         << "  }\n";
+      additional_impl << "  if (lengthResized == 1) {\n"
+                      << "    return 0.0;\n"
+                      << "  } else {\n"
+                      << "    let whole = f32(xResized * (lengthOriginal - 1) / (lengthResized - 1));\n"
+                      << "    let fract = f32(xResized * (lengthOriginal - 1) % (lengthResized - 1)) / f32(lengthResized - 1);\n"
+                      << "    return whole + fract;\n"
+                      << "  }\n";
       break;
     case CoordinateTransformMode::TfCropAndResize:
-      ss << "  if (lengthResized > 1u) {\n"
-         << "    return roiStart * f32(lengthOriginal - 1u) + (f32(xResized) * (roiEnd - roiStart) * f32(lengthOriginal - 1u)) / f32(lengthResized - 1u);\n"
-         << "  } else {\n"
-         << "    return 0.5 * (roiStart + roiEnd) * f32(lengthOriginal - 1u);\n"
-         << "  }\n";
+      additional_impl << "  if (lengthResized > 1) {\n"
+                      << "    return f32(roiStart) * f32(lengthOriginal - 1) +\n"
+                      << "           (f32(xResized) * f32(roiEnd - roiStart) * f32(lengthOriginal - 1)) /\n"
+                      << "           f32(lengthResized - 1);\n"
+                      << "  } else {\n"
+                      << "    return 0.5 * f32(roiStart + roiEnd) * f32(lengthOriginal - 1);\n"
+                      << "  }\n";
       break;
     case CoordinateTransformMode::HalfPixelSymmetric:
-      ss << "  let outputWidth = xScale * f32(lengthResized);\n"
-         << "  let adjustment = f32(lengthResized) / outputWidth;\n"
-         << "  let center = f32(lengthOriginal) / 2.0;\n"
-         << "  let offset = center * (1.0 - adjustment);\n"
-         << "  return offset + ((f32(xResized) + 0.5) / xScale) - 0.5;\n";
+      additional_impl << "  let outputWidth = f32(xScale) * f32(lengthResized);\n"
+                      << "  let adjustment = f32(lengthResized) / outputWidth;\n"
+                      << "  let center = f32(lengthOriginal) / 2.0;\n"
+                      << "  let offset = center * (1.0 - adjustment);\n"
+                      << "  return offset + ((f32(xResized) + 0.5) / f32(xScale)) - 0.5;\n";
       break;
     case CoordinateTransformMode::HalfPixel:
-      ss << "  return ((f32(xResized) + 0.5) / xScale) - 0.5;\n";
+      additional_impl << "  return ((f32(xResized) + 0.5) / f32(xScale)) - 0.5;\n";
       break;
     default:
-      return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Unsupported CoordinateTransformMode");
+      ORT_RETURN_IF_ERROR(Status(common::ONNXRUNTIME, common::INVALID_ARGUMENT, "Unsupported CoordinateTransformMode in shader generation."));
   }
-  ss << "}\n\n";
+  additional_impl << "}\n\n";
 
-  // Define getNearestPixelFromOriginal function
-  ss << "fn getNearestPixelFromOriginal(xOriginal: f32, isDownSample: bool) -> f32 {\n";
+  // 2. Define getNearestPixelFromOriginal function
+  additional_impl << "fn getNearestPixelFromOriginal(xOriginal: f32, isDownSample: bool) -> f32 {\n";
   switch (attributes_.nearestMode) {
     case NearestMode::RoundPreferFloor:
-      ss << "  if (fract(xOriginal) == 0.5) {\n"
-         << "    return floor(xOriginal);\n"
-         << "  } else {\n"
-         << "    return round(xOriginal);\n"
-         << "  }\n";
+      additional_impl << "  if (fract(xOriginal) == 0.5) {\n"
+                      << "    return floor(xOriginal);\n"  // Corrected to 'floor' as per user feedback
+                      << "  } else {\n"
+                      << "    return round(xOriginal);\n"
+                      << "  }\n";
       break;
     case NearestMode::RoundPreferCeil:
-      ss << "  if (fract(xOriginal) == 0.5) {\n"
-         << "    return ceil(xOriginal);\n"
-         << "  } else {\n"
-         << "    return round(xOriginal);\n"
-         << "  }\n";
+      additional_impl << "  if (fract(xOriginal) == 0.5) {\n"
+                      << "    return ceil(xOriginal);\n"
+                      << "  } else {\n"
+                      << "    return round(xOriginal);\n"
+                      << "  }\n";
       break;
     case NearestMode::Floor:
-      ss << "  return floor(xOriginal);\n";
+      additional_impl << "  return floor(xOriginal);\n";
       break;
     case NearestMode::Ceil:
-      ss << "  return ceil(xOriginal);\n";
+      additional_impl << "  return ceil(xOriginal);\n";
       break;
     case NearestMode::Simple:
-      if (GetOpsetVersionFromCustomDataBuffer(shader.GetComputeContext()) < 11) {
-        ss << "  if (isDownSample) {\n"
-           << "    return ceil(xOriginal);\n"
-           << "  } else {\n"
-           << "    return xOriginal;\n"
-           << "  }\n";
+      if (attributes_.opset < 11) {
+        additional_impl << "  if (isDownSample) {\n"
+                        << "    return ceil(xOriginal);\n"
+                        << "  } else {\n"
+                        << "    return xOriginal;\n"
+                        << "  }\n";
       } else {
-        return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Nearest mode 'simple' not supported for opset >= 11");
+        ORT_RETURN_IF_ERROR(Status(common::ONNXRUNTIME, common::INVALID_ARGUMENT, "Nearest mode 'simple' not supported for opset >= 11."));
       }
       break;
     default:
-      return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Unsupported NearestMode");
+      ORT_RETURN_IF_ERROR(Status(common::ONNXRUNTIME, common::INVALID_ARGUMENT, "Unsupported NearestMode in shader generation."));
   }
-  ss << "}\n\n";
+  additional_impl << "}\n\n";
 
-  // Define helper functions for interpolation (bilinear, trilinear, bicubic)
-  // For brevity, only bilinear is implemented here. Similar implementations are needed for trilinear and bicubic.
+  // 3. Define calculateOriginalIndicesFromOutputIndices function
+  // Use "output_indices_t" as per type alias convention
+  size_t output_shape_length = attributes_.output_shape.NumDimensions();
+  size_t input_shape_length = attributes_.input_shape.NumDimensions();
+  bool is_f16 = attributes_.input_is_fp16;
+  bool use_extrapolation = attributes_.coordinateTransformMode == CoordinateTransformMode::TfCropAndResize;
+  additional_impl << "fn calculateOriginalIndicesFromOutputIndices(output_indices: output_indices_t) -> array<output_value_t, "
+                  << output_shape_length << "> {\n"
+                  << "  var original_indices: array<output_value_t, " << output_shape_length << ">;\n"
+                  << "  for (var i: u32 = 0u; i < " << output_shape_length << "u; i = i + 1u) {\n"
+                  << "    let output_index = " << output.GetByIndices("i") << ";\n"
+                  << "    let scale = " << GetElementAt("uniforms.scales", "i", attributes_.scales.size(), is_f16) << ";\n"
+                  << "    let roi_low = " << GetElementAt("uniforms.roi", "i", attributes_.roi.size(), is_f16) << ";\n"
+                  << "    let roi_hi = " << GetElementAt("uniforms.roi", "i + " + std::to_string(input_shape_length), attributes_.roi.max_size(), is_f16) << ";\n"
+                  << "    if (scale == 1.0) {\n"
+                  << "      original_indices[i] = output_value_t(output_index);\n"
+                  << "    } else {\n"
+                  << "      let input_shape_i = " << GetElementAt("uniforms.input_shape", "i", input_shape_length, is_f16) << ";\n"
+                  << "      let output_shape_i = " << GetElementAt("uniforms.output_shape", "i", output_shape_length, is_f16) << ";\n"
+                  << "      original_indices[i] = getOriginalCoordinateFromResizedCoordinate(output_index, scale, output_shape_i,\n"
+                  << "                                                                       input_shape_i, roi_low, roi_hi);\n"
+                  << "    }\n"
+                  << "  }\n"
+                  << "  return original_indices;\n"
+                  << "}\n";
 
+  // 4. Define calculateInputIndicesFromOutputIndices function
+  // Use "input_indices_t" as per type alias convention
+  additional_impl << "fn calculateInputIndicesFromOutputIndices(output_indices: output_indices_t) -> input_indices_t {\n"
+                  << "  var input_indices: input_indices_t;\n"
+                  << "  for (var i: u32 = 0u; i < " << output_shape_length << "; i++) {\n"
+                  << "    var output_index = ${output.indicesGet('output_indices', 'i')};"
+                  << "    var output_index = " << output.IndicesGet("output_indices", "i") << ";\n"
+                  << "    var input_index: u32;\n"
+                  << "    var scale = ${getElementAt('uniforms.scales', 'i', scalesLength)};" << ";\n"
+                  << "    var scale = " << GetElementAt("uniforms.scales", "i", attributes_.scales.size()) << ";\n"
+                  << "    if (scale == 1.0) {" << "\n"
+                  << "      input_index = output_index;\n"
+                  << "    } else {\n"
+                  << "      var roi_low = " << GetElementAt("uniforms.roi", "i", attributes_.roi.size()) << ";\n"
+                  << "      var roi_hi = " << GetElementAt("uniforms.roi", MakeString("i + ", input_shape_length), attributes_.roi.size()) << ";\n"
+                  << "      var input_shape_i = " << GetElementAt("uniforms.input_shape", "i", input_shape_length) << ";\n"
+                  << "      var output_shape_i = " << GetElementAt("uniforms.output_shape", "i", output_shape_length) << ";\n"
+                  << "      var original_idx = getOriginalCoordinateFromResizedCoordinate(output_index, scale, output_shape_i," << "\n"
+                  << "                                                                    input_shape_i, roi_low, roi_hi);\n"
+                  << "      if (!" << use_extrapolation << " || (original_idx >= 0 && original_idx < output_value_t(input_shape_i))) {\n"
+                  << "        if (original_idx < 0) {\n"
+                  << "          input_index = 0;\n"
+                  << "        } else if (original_idx > output_value_t(input_shape_i - 1)) {\n"
+                  << "          input_index = input_shape_i - 1;\n"
+                  << "        } else {\n"
+                  << "          input_index = u32(getNearestPixelFromOriginal(original_idx, scale < 1));\n"
+                  << "        }\n"
+                  << "      } else {\n"
+                  << "        input_index = u32(original_idx);\n"
+                  << "      }\n"
+                  << "    }\n"
+                  << "    " << input.IndicesSet("input_indices", "i", "input_index") << ";\n"
+                  << "  }\n"
+                  << "  return input_indices;\n"
+                  << "}";
+
+  // 5. Define checkInputIndices function
+  additional_impl << "fn checkInputIndices(input_indices: input_indices_t) -> bool {\n"
+                  << "  for (var i: u32 = 0u; i < " << output_shape_length << "u; i = i + 1u) {\n"
+                  << "  var input_index = ${input.indicesGet('input_indices', 'i')};\n"
+                  << "  var input_index = " << input.IndicesGet("input_indices", "i") << ";\n"
+                  << "  if (input_index < 0 || input_index >= ${getElementAt('uniforms.input_shape', 'i', inputShape.length)}) {\n"
+                  << "  if (input_index < 0 || input_index >= " << GetElementAt("uniforms.input_shape", "i", input_shape_length) << ") {\n"
+                  << "    return false;\n"
+                  << "  }\n"
+                  << "}\n"
+                  << "return true;\n"
+                  << "}\n\n";
+
+  // 6. Define interpolation functions based on mode
   if (attributes_.mode == Mode::Linear) {
-    if (shader.GetInputShapeSize() == 2 || shader.GetInputShapeSize() == 4) {  // 2D or 4D
-      // Bilinear Interpolation
-      ss << "fn bilinearInterpolation(output_indices: array<u32, " << shader.GetInputShapeSize() << ">) -> f32 {\n"
-         << "  let row = uniforms.roi[0] + (f32(output_indices[1]) * uniforms.scales[1]);\n"
-         << "  let col = uniforms.roi[1] + (f32(output_indices[2]) * uniforms.scales[2]);\n"
-         << "  let row1 = u32(floor(row));\n"
-         << "  let col1 = u32(floor(col));\n"
-         << "  let row2 = row1 + 1u;\n"
-         << "  let col2 = col1 + 1u;\n"
-         << "  let dx = row - f32(row1);\n"
-         << "  let dy = col - f32(col1);\n"
-         << "  let val11 = input[output_indices[0], row1, col1, output_indices[3]];\n"
-         << "  let val12 = input[output_indices[0], row1, col2, output_indices[3]];\n"
-         << "  let val21 = input[output_indices[0], row2, col1, output_indices[3]];\n"
-         << "  let val22 = input[output_indices[0], row2, col2, output_indices[3]];\n"
-         << "  return (val11 * (1.0 - dx) * (1.0 - dy)) + (val12 * (1.0 - dx) * dy) + (val21 * dx * (1.0 - dy)) + (val22 * dx * dy);\n"
-         << "}\n\n";
-    }
-    // Implement trilinear and other interpolations similarly...
-  }
+    if (input_shape_length == 2 || input_shape_length == 4) {
+      constexpr const bool is_nchw = true;
+      auto [batchIdx, heightIdx, widthIdx, channelIdx] =
+          input_shape_length == 2 ? std::make_tuple(-1, 0, 1, -1) : is_nchw ? std::make_tuple(0, 2, 3, 1)
+                                                                            : std::make_tuple(0, 1, 2, 3);
+      // Bilinear interpolation
+      additional_impl
+          << "    fn getInputValue(batch: u32, channel: u32, row: u32, col: u32) -> input_value_t {\n"
+          << "      var input_indices: input_indices_t;\n"
+          << "      ${input.indicesSet('input_indices', heightIdx, `max(0, min(row, ${inputShape[heightIdx]} - 1))`)};\n"
+          << "      " << input.IndicesSet("input_indices", heightIdx, MakeString("max(0, min(row, ", attributes_.input_shape[heightIdx] - 1)) << ";\n"
+          << "      ${input.indicesSet('input_indices', widthIdx, `max(0, min(col, ${inputShape[widthIdx]} - 1))`)};\n"
+          << "      " << input.IndicesSet("input_indices", widthIdx, MakeString("max(0, min(col, ", attributes_.input_shape[widthIdx] - 1)) << ";\n"
+          << "      " << SetChannelAndBatchIndices(input, channelIdx, batchIdx, 2) << "\n"
+          << "      return " << input.GetByIndices("input_indices") << ";\n"
+          << "    }\n"
+          << "\n"
+          << "    fn bilinearInterpolation(output_indices: output_indices_t) -> input_value_t {\n"
+          << "      var originalIndices = calculateOriginalIndicesFromOutputIndices(output_indices);\n"
+          << "      var row:input_value_t = originalIndices[" << heightIdx << "];\n"
+          << "      var col:input_value_t = originalIndices[" << widthIdx << "];\n";
 
-  // Main function
-  ss << "fn main() {\n"
-     << "  if (global_idx >= uniforms.output_size) { return; }\n"
-     << "  let output_indices = offsetToIndices(global_idx);\n";
-
-  // Depending on mode, generate different interpolation logic
-  std::string mode_str = ModeToWGSL(attributes_.mode);
-  if (attributes_.mode == Mode::Nearest) {
-    ss << "  // Nearest mode interpolation\n"
-       << "  var input_indices: array<u32, " << shader.GetInputShapeSize() << ">;\n"
-       << "  for (var i: u32 = 0u; i < " << shader.GetInputShapeSize() << "; i = i + 1u) {\n"
-       << "    let scale = uniforms.scales[i];\n"
-       << "    let roi_start = uniforms.roi[i];\n"
-       << "    let roi_end = uniforms.roi[" << shader.GetInputShapeSize() << " + i];\n"
-       << "    let original_coord = getOriginalCoordinateFromResizedCoordinate(output_indices[i], scale, uniforms.output_shape[i], uniforms.input_shape[i], roi_start, roi_end);\n"
-       << "    if (scale == 1.0) {\n"
-       << "      input_indices[i] = output_indices[i];\n"
-       << "    } else {\n"
-       << "      let input_coord = getNearestPixelFromOriginal(original_coord, scale < 1.0);\n"
-       << "      input_indices[i] = u32(input_coord);\n"
-       << "    }\n"
-       << "  }\n"
-       << "  // Set the output value from the input tensor\n"
-       << "  output[global_idx] = input[input_indices];\n";
-  } else if (attributes_.mode == Mode::Linear) {
-    if (shader.GetInputShapeSize() == 2 || shader.GetInputShapeSize() == 4) {  // 2D or 4D
-      ss << "  // Bilinear interpolation\n"
-         << "  let interpolated_val = bilinearInterpolation(output_indices);\n"
-         << "  output[global_idx] = interpolated_val;\n";
+      if (use_extrapolation) {
+        additional_impl
+            << "      if (row < 0 || row > (" << attributes_.input_shape[heightIdx] << " - 1) || col < 0 || col > (" << attributes_.input_shape[widthIdx] << " - 1)) {\n"
+            << "        return " << attributes_.extrapolationValue << ";\n"
+            << "      }\n";
+      }
+      additional_impl << "      row = max(0, min(row, " << attributes_.input_shape[heightIdx] << " - 1));\n"
+                      << "      col = max(0, min(col, " << attributes_.input_shape[widthIdx] << " - 1));\n"
+                      << "      var row1: u32 = u32(row);\n"
+                      << "      var col1: u32 = u32(col);\n"
+                      << "      var row2: u32 = u32(row + 1);\n"
+                      << "      var col2: u32 = u32(col + 1);\n"
+                      << "      var channel: u32 = " << (input_shape_length > 2 ? MakeString("u32(originalIndices[", channelIdx, "])") : "0") << ";\n"
+                      << "      var channel: u32 = ;\n"
+                      << "      var batch: u32 =  " << (input_shape_length > 2 ? MakeString("u32(originalIndices[", batchIdx, "])") : "0") << ";\n"
+                      << "      var x11: input_value_t = getInputValue(batch, channel, row1, col1);\n"
+                      << "      var x12: input_value_t = getInputValue(batch, channel, row1, col2);\n"
+                      << "      var x21: input_value_t = getInputValue(batch, channel, row2, col1);\n"
+                      << "      var x22: input_value_t = getInputValue(batch, channel, row2, col2);\n"
+                      << "      var dx1: input_value_t = abs(row - input_value_t(row1));\n"
+                      << "      var dx2: input_value_t = abs(input_value_t(row2) - row);\n"
+                      << "      var dy1: input_value_t = abs(col - input_value_t(col1));\n"
+                      << "      var dy2: input_value_t = abs(input_value_t(col2) - col);\n"
+                      << "      if (row1 == row2) {\n"
+                      << "        dx1 = 0.5;\n"
+                      << "        dx2 = 0.5;\n"
+                      << "      }\n"
+                      << "      if (col1 == col2) {\n"
+                      << "        dy1 = 0.5;\n"
+                      << "        dy2 = 0.5;\n"
+                      << "      }\n"
+                      << "      return (x11 * dx2 * dy2 + x12 * dx2 * dy1 + x21 * dx1 * dy2 + x22 * dx1 * dy1);\n"
+                      << "    }\n";
+    } else if (input_shape_length == 3 || input_shape_length == 5) {
+      constexpr const bool is_nchw = true;
+      auto [batchIdx, depthIdx, heightIdx, widthIdx, channelIdx] =
+          input_shape_length == 3 ? std::make_tuple(-1, 0, 1, 2, -1) : is_nchw ? std::make_tuple(0, 2, 3, 4, 1)
+                                                                               : std::make_tuple(0, 1, 2, 3, 4);
+      // Trilinear interpolation
+      additional_impl
+          << "    fn getInputValue(batch: u32, channel: u32, depth:u32, height: u32, width: u32) -> input_value_t {\n"
+          << "      var input_indices: input_indices_t;\n"
+          << "      " << input.IndicesSet("input_indices", depthIdx, MakeString("max(0, min(depth, ", attributes_.input_shape[depthIdx] - 1)) << ";\n"
+          << "      " << input.IndicesSet("input_indices", heightIdx, MakeString("")) << ";\n"
+          << "      " << input.IndicesSet("input_indices", widthIdx, MakeString("max(0, min(width, ", attributes_.input_shape[widthIdx] - 1)) << ";\n"
+          << "      ${setChannelAndBatchIndices(input, channelIdx, batchIdx, 3)}\n"
+          << "      " << SetChannelAndBatchIndices(input, channelIdx, batchIdx, 3) << "\n"
+          << "      return " << input.GetByIndices("input_indices") << ";\n"
+          << "    }\n"
+          << "\n"
+          << "    fn trilinearInterpolation(output_indices: output_indices_t) -> input_value_t {\n"
+          << "      var originalIndices = calculateOriginalIndicesFromOutputIndices(output_indices);\n"
+          << "      var depth:input_value_t = originalIndices[" << depthIdx << "];\n"
+          << "      var height:input_value_t = originalIndices[${heightIdx}];\n"
+          << "      var height:input_value_t = originalIndices[" << heightIdx << "];\n"
+          << "      var width:input_value_t = originalIndices[" << widthIdx << "];\n";
+      if (use_extrapolation) {
+        additional_impl << "      if (depth < 0 || depth > " << (attributes_.input_shape[depthIdx] - 1) << " || height < 0 || height > " << (attributes_.input_shape[heightIdx] - 1) << " || width < 0 || width > " << (attributes_.input_shape[widthIdx] - 1) << ") {\n"
+                        << "        return " << attributes_.extrapolationValue << ";\n"
+                        << "     }\n";
+      }
+      additional_impl
+          << "      depth = max(0, min(depth, " << (attributes_.input_shape[depthIdx] - 1) << "));\n"
+          << "      height = max(0, min(height, " << (attributes_.input_shape[heightIdx] - 1) << "));\n"
+          << "      width = max(0, min(width, " << (attributes_.input_shape[widthIdx] - 1) << "));\n"
+          << "      var depth1: u32 = u32(depth);\n"
+          << "      var height1: u32 = u32(height);\n"
+          << "      var width1: u32 = u32(width);\n"
+          << "      var depth2: u32 = u32(depth + 1);\n"
+          << "      var height2: u32 = u32(height + 1);\n"
+          << "      var width2: u32 = u32(width + 1);\n"
+          << "      var channel: u32 = ";
+      if (input_shape_length > 3) {
+        additional_impl << "u32(originalIndices[" << channelIdx << "])";
+      } else {
+        additional_impl << "0";
+      }
+      additional_impl << ";\n"
+                      << "      var batch: u32 =  ";
+      if (input_shape_length > 3) {
+        additional_impl << "u32(originalIndices[" << batchIdx << "])";
+      } else {
+        additional_impl << "0";
+      }
+      additional_impl << ";\n"
+                      << "      var x111: input_value_t = getInputValue(batch, channel, depth1, height1, width1);\n"
+                      << "      var x112: input_value_t = getInputValue(batch, channel, depth1, height1, width2);\n"
+                      << "      var x121: input_value_t = getInputValue(batch, channel, depth1, height2, width1);\n"
+                      << "      var x122: input_value_t = getInputValue(batch, channel, depth1, height2, width2);\n"
+                      << "      var x211: input_value_t = getInputValue(batch, channel, depth2, height1, width1);\n"
+                      << "      var x212: input_value_t = getInputValue(batch, channel, depth2, height1, width2);\n"
+                      << "      var x221: input_value_t = getInputValue(batch, channel, depth2, height2, width1);\n"
+                      << "      var x222: input_value_t = getInputValue(batch, channel, depth2, height2, width2);\n"
+                      << "      var dx1: input_value_t = abs(depth - input_value_t(depth1));\n"
+                      << "      var dx2: input_value_t = abs(input_value_t(depth2) - depth);\n"
+                      << "      var dy1: input_value_t = abs(height - input_value_t(height1));\n"
+                      << "      var dy2: input_value_t = abs(input_value_t(height2) - height);\n"
+                      << "      var dz1: input_value_t = abs(width - input_value_t(width1));\n"
+                      << "      var dz2: input_value_t = abs(input_value_t(width2) - width);\n"
+                      << "      if (depth1 == depth2) {\n"
+                      << "        dx1 = 0.5;\n"
+                      << "        dx2 = 0.5;\n"
+                      << "      }\n"
+                      << "      if (height1 == height2) {\n"
+                      << "        dy1 = 0.5;\n"
+                      << "        dy2 = 0.5;\n"
+                      << "      }\n"
+                      << "      if (width1 == width2) {\n"
+                      << "        dz1 = 0.5;\n"
+                      << "        dz2 = 0.5;\n"
+                      << "      }\n"
+                      << "      return (x111 * dx2 * dy2 * dz2 + x112 * dx2 * dy2 * dz1 + x121 * dx2 * dy1 *dz2 + x122 * dx2 * dy1 * dz1 +\n"
+                      << "              x211 * dx1 * dy2 * dz2 + x212 * dx1 * dy2 * dz1 + x221 * dx1 * dy1 *dz2 + x222 * dx1 * dy1 * dz1);\n"
+                      << "    }";
+    } else {
+      ORT_RETURN_IF_ERROR(Status(common::ONNXRUNTIME, common::INVALID_ARGUMENT, "Linear mode only supports input dims 2, 3, 4 and 5 are supported in linear mode."));
     }
-    // Implement trilinear and other interpolations similarly...
   } else if (attributes_.mode == Mode::Cubic) {
-    // Implement bicubic interpolation here...
-    ss << "  // Bicubic interpolation not implemented yet.\n";
-    // Placeholder
-    ss << "  output[global_idx] = 0.0;\n";
+    const bool is_2d = input_shape_length == 2;
+    constexpr const bool is_nchw = true;
+    int heightIdx, widthIdx;
+    std::tie(heightIdx, widthIdx) = is_2d ? std::make_tuple(0, 1) : is_nchw ? std::make_tuple(2, 3)
+                                                                            : std::make_tuple(1, 2);
+    // Define the lambda for creating cubic interpolation functions
+    auto createCubicInterpolationFunction = [&](int idx) -> std::string {
+      std::string direction = (idx == heightIdx) ? "row" : "col";
+      std::ostringstream func;
+
+      func << "fn " << direction << "CubicInterpolation(input_indices: input_indices_t, output_indices: output_indices_t) -> input_value_t {\n"
+           << "  var output_index = " << output.IndicesGet("output_indices", idx) << ";\n"
+           << "  var originalIdx: input_value_t = getOriginalCoordinateFromResizedCoordinate(output_index, "
+           << attributes_.scales[idx] << ", " << attributes_.output_shape[idx] << ", " << attributes_.input_shape[idx] << ", "
+           << attributes_.roi[idx] << ", " << (attributes_.roi[idx] + input_shape_length) << ");\n"
+           << "  var fractOriginalIdx: input_value_t = originalIdx - floor(originalIdx);\n"
+           << "  var coefs = getCubicInterpolationCoefs(fractOriginalIdx);\n\n"
+           << "  if (" << (use_extrapolation ? "true" : "false") << " && (originalIdx < 0.0 || originalIdx > ("
+           << (attributes_.input_shape[idx] - 1) << ".0))) {\n"
+           << "    return " << attributes_.extrapolationValue << ";\n"
+           << "  }\n"
+           << "  var data: array<input_value_t, 4> = array<input_value_t, 4>(0.0, 0.0, 0.0, 0.0);\n"
+           << "  for (var i: i32 = -1; i < 3; i = i + 1) {\n"
+           << "    var " << direction << ": input_value_t = originalIdx + input_value_t(i);\n"
+           << "    if (" << direction << " < 0.0 || " << direction << " >= " << (attributes_.input_shape[idx] - 1) << ".0) {\n";
+
+      if (attributes_.excludeOutside) {
+        func << "      coefs[i + 1] = 0.0;\n"
+             << "      continue;\n";
+      } else if (use_extrapolation) {
+        func << "      return " << attributes_.extrapolationValue << ";\n";
+      } else {
+        func << "      " << direction << " = max(0.0, min(" << direction << ", " << (attributes_.input_shape[idx] - 1) << ".0));\n";
+      }
+
+      func << "    }\n"
+           << "    var input_indices_copy: input_indices_t = input_indices;\n"
+           << "    " << input.IndicesSet("input_indices_copy", idx, "u32(" + direction + ")") << ";\n"
+           << "    data[i + 1] = "
+           << ((idx == heightIdx) ? input.GetByIndices("input_indices_copy") : "rowCubicInterpolation(input_indices_copy, output_indices)") << ";\n"
+           << "  }\n"
+           << "  return cubicInterpolation1D(data, coefs);\n"
+           << "}\n\n";
+
+      return func.str();
+    };
+    // Append cubic interpolation functions for height and width indices
+    additional_impl << createCubicInterpolationFunction(heightIdx);
+    additional_impl << createCubicInterpolationFunction(widthIdx);
+    // Define getCubicInterpolationCoefs function
+    additional_impl << "fn getCubicInterpolationCoefs(s: input_value_t) -> array<input_value_t, 4> {\n"
+                    << "  var absS = abs(s);\n"
+                    << "  var coeffs: array<input_value_t, 4> = array<input_value_t, 4>(0.0, 0.0, 0.0, 0.0);\n"
+                    << "  var oneMinusAbsS: input_value_t = 1.0 - absS;\n"
+                    << "  var twoMinusAbsS: input_value_t = 2.0 - absS;\n"
+                    << "  var onePlusAbsS: input_value_t = 1.0 + absS;\n"
+                    << "  coeffs[0] = ((" << attributes_.cubicCoeffA << " * onePlusAbsS - 5.0 * " << attributes_.cubicCoeffA
+                    << ") * onePlusAbsS + 8.0 * " << attributes_.cubicCoeffA
+                    << ") * onePlusAbsS - 4.0 * " << attributes_.cubicCoeffA << ";\n"
+                    << "  coeffs[1] = ((" << attributes_.cubicCoeffA << " + 2.0) * absS - (" << attributes_.cubicCoeffA
+                    << " + 3.0)) * absS * absS + 1.0;\n"
+                    << "  coeffs[2] = ((" << attributes_.cubicCoeffA << " + 2.0) * oneMinusAbsS - (" << attributes_.cubicCoeffA
+                    << " + 3.0)) * oneMinusAbsS * oneMinusAbsS + 1.0;\n"
+                    << "  coeffs[3] = ((" << attributes_.cubicCoeffA << " * twoMinusAbsS - 5.0 * " << attributes_.cubicCoeffA
+                    << ") * twoMinusAbsS + 8.0 * " << attributes_.cubicCoeffA
+                    << ") * twoMinusAbsS - 4.0 * " << attributes_.cubicCoeffA << ";\n"
+                    << "  return coeffs;\n"
+                    << "}\n\n";
+
+    // Define cubicInterpolation1D function
+    additional_impl << "fn cubicInterpolation1D(x: array<input_value_t, 4>, coefs: array<input_value_t, 4>) -> input_value_t {\n"
+                    << "  var coefsSum: input_value_t = coefs[0] + coefs[1] + coefs[2] + coefs[3];\n"
+                    << "  return (x[0] * coefs[0] + x[1] * coefs[1] + x[2] * coefs[2] + x[3] * coefs[3]) / coefsSum;\n"
+                    << "}\n\n";
+
+    // Define bicubicInterpolation function
+    additional_impl << "fn bicubicInterpolation(output_indices: output_indices_t) -> input_value_t {\n"
+                    << "  var input_indices: input_indices_t = output_indices;\n"
+                    << "  return colCubicInterpolation(input_indices, output_indices);\n"
+                    << "}\n\n";
   } else {
-    return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Unsupported Mode in shader generation");
+    ORT_RETURN_IF_ERROR(Status(common::ONNXRUNTIME, common::INVALID_ARGUMENT, "Unsupported interpolation mode."));
   }
 
-  ss << "}\n";
+  // Inject the additional implementations into the shader
+  shader.AdditionalImplementation() << additional_impl.str();
 
-  // Assign the generated shader code to the ShaderHelper
-  shader.SetCode(ss.str());
+  // Start building the main shader function body
+  std::stringstream main_body;
 
+  // Inject guard against out-of-bounds workgroup sizes
+  main_body << shader.GuardAgainstOutOfBoundsWorkgroupSizes("uniforms.output_size") << "\n";
+
+  // Determine if scaling is required
+  bool noScale = attributes_.input_shape == attributes_.output_shape;
+
+  if (noScale) {
+    // No scaling; direct copy
+    main_body << output.SetByIndices("global_idx", input.GetByIndices("global_idx")) << ";\n";
+  } else {
+    // Scaling required
+    main_body << "  let output_indices = " << output.OffsetToIndices("global_idx") << ";\n"
+              << "  var input_indices: input_indices_type;\n";
+
+    if (attributes_.mode == Mode::Nearest) {
+      main_body << "input_indices = calculateInputIndicesFromOutputIndices(output_indices);\n"
+                << "  if (checkInputIndices(input_indices)) {\n"
+                << "    " << output.SetByIndices("global_idx", input.GetByIndices("input_indices")) << ";\n"
+                << "  } else {\n"
+                << "    " << output.SetByIndices("global_idx", std::to_string(attributes_.extrapolationValue)) << ";\n"
+                << "  }\n";
+    } else if (attributes_.mode == Mode::Linear) {
+      // Bilinear interpolation
+      std::string selected_function = (input_shape_length == 2 || input_shape_length == 4 ? "bilinearInterpolation" : "trilinearInterpolation");
+      main_body << "  " << output.SetByIndices("global_idx", selected_function + "(output_indices)") << ";\n";
+    } else if (attributes_.mode == Mode::Cubic) {
+      main_body << "  " << output.SetByIndices("global_idx", "bicubicInterpolation(output_indices)") << ";\n";
+    } else {
+      ORT_RETURN_IF_ERROR(Status(common::ONNXRUNTIME, common::INVALID_ARGUMENT, "Unsupported resize mode."));
+    }
+  }
+
+  // Inject the main function body
+  shader.MainFunctionBody() << main_body.str();
   return Status::OK();
 }
 
 Resize::Resize(const OpKernelInfo& info) : WebGpuKernel(info) {
   // Parse attributes
   attributes_ = ParseResizeAttributes(info);
-  optset_ = info.node().SinceVersion();
 }
 
 // Resize::ComputeInternal implementation
@@ -496,85 +802,148 @@ Status Resize::ComputeInternal(ComputeContext& context) const {
     return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Input tensor is null");
   }
 
-  std::vector<const Tensor*> inputs = context.inputs;
   std::vector<float> scales;
   std::vector<int64_t> sizes;
   std::vector<float> roi;
 
   // Extract opset version from custom data buffer
   int opsetVersion;
-  opsetVersion = opset_;
+  opsetVersion = attributes_.opset;
 
   // Validate inputs and populate scales, sizes, roi
   try {
-    ValidateInputs(inputs, attributes_, opsetVersion, scales, sizes, roi);
+    ValidateInputs(context, attributes_, opsetVersion, scales, sizes, roi);
   } catch (const std::exception& ex) {
     return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, ex.what());
   }
+  auto updateRoI = [](const std::vector<float>& roi, const std::vector<int64_t>& axes, size_t rank) -> std::vector<float> {
+    std::vector<float> roiTmp(rank * 2, 0);                    // Create a vector with 'rank' 0's followed by 'rank' 1's
+    std::vector<float> roiLocal = roi.empty() ? roiTmp : roi;  // If roi is empty, use roiTmp, otherwise copy roi
 
-  // Determine output shape
+    if (!axes.empty()) {
+      for (size_t i = 0; i < axes.size(); ++i) {
+        int64_t v = axes[i];
+        roiTmp[v] = roiLocal[i];
+        roiTmp[i + rank] = roiLocal[axes.size() + i];
+      }
+      return roiTmp;
+    }
+
+    return roiLocal;
+  };
+
+  auto initOutputShape = [](const gsl::span<const int64_t>& inputShape,
+                            const std::vector<float>& scales,
+                            const std::vector<int64_t>& sizes,
+                            const std::vector<int64_t>& axes) -> std::vector<int64_t> {
+    std::vector<int64_t> outputShape;
+
+    if (!sizes.empty()) {
+      if (!axes.empty()) {
+        // Copy inputShape into outputShape
+        outputShape.insert(outputShape.end(), inputShape.begin(), inputShape.end());
+
+        // Check that axes is not out of bounds
+        if (static_cast<size_t>(*std::max_element(axes.begin(), axes.end())) > inputShape.size()) {
+          throw std::out_of_range("axes is out of bound");
+        }
+
+        // Set values in outputShape based on axes and sizes
+        for (size_t i = 0; i < axes.size(); ++i) {
+          outputShape[axes[i]] = sizes[i];
+        }
+      } else {
+        // Just copy sizes into outputShape
+        outputShape = sizes;
+      }
+    } else {
+      if (scales.empty()) {
+        throw std::invalid_argument("Resize requires either scales or sizes.");
+      } else {
+        // Scale inputShape using scales and round the values
+        for (size_t i = 0; i < inputShape.size(); ++i) {
+          outputShape.push_back(std::round(inputShape[i] * scales[i]));
+        }
+      }
+    }
+
+    return outputShape;
+  };
+  auto adjustOutputShape = [](const gsl::span<const int64_t>& inputShape,
+                              std::vector<float>& scales,
+                              const ResizeAttributes& attributes) -> std::vector<int64_t> {
+    // Define a lambda for scale in policy based on the provided `keepAspectRatioPolicy`
+    float scaleInPolicy = [&]() -> float {
+      if (attributes.keepAspectRatioPolicy == KeepAspectRatioPolicy::NotLarger) {
+        if (!attributes.axes.empty()) {
+          return *std::min_element(attributes.axes.begin(), attributes.axes.end(),
+                                   [&](int i, int j) { return scales[i] < scales[j]; });
+        } else {
+          return *std::min_element(scales.begin(), scales.end());
+        }
+      } else if (attributes.keepAspectRatioPolicy == KeepAspectRatioPolicy::NotSmaller) {
+        if (!attributes.axes.empty()) {
+          return *std::max_element(attributes.axes.begin(), attributes.axes.end(),
+                                   [&](int i, int j) { return scales[i] < scales[j]; });
+        } else {
+          return *std::max_element(scales.begin(), scales.end());
+        }
+      } else {
+        throw std::invalid_argument("Keep aspect ratio policy " + ResizeProgram::KeepAspectRatioPolicyToWGSL(attributes.keepAspectRatioPolicy) + " is not supported");
+      }
+    }();
+
+    // Reset scales to 1.0 for all dimensions
+    std::fill(scales.begin(), scales.end(), 1.0f);
+
+    std::vector<int64_t> adjustedOutputShape = inputShape;
+
+    if (!attributes.axes.empty()) {
+      // Set scale in policy for each axis in axes
+      for (size_t i = 0; i < attributes.axes.size(); ++i) {
+        scales[attributes.axes[i]] = scaleInPolicy;
+        adjustedOutputShape[attributes.axes[i]] = std::round(inputShape[attributes.axes[i]] * scales[attributes.axes[i]]);
+      }
+    } else {
+      // Set all scales to scaleInPolicy if no axes are provided
+      std::fill(scales.begin(), scales.end(), scaleInPolicy);
+      for (size_t i = 0; i < inputShape.size(); ++i) {
+        adjustedOutputShape[i] = std::round(inputShape[i] * scales[i]);
+      }
+    }
+
+    return adjustedOutputShape;
+  };
+
+  // Determine output shape using the provided lambdas
   std::vector<int64_t> output_dims;
   const auto& input_dims = input_tensor->Shape().GetDims();
-  if (!sizes.empty()) {
-    if (!attributes_.axes.empty()) {
-      output_dims = input_dims;
-      for (size_t i = 0; i < attributes_.axes.size(); ++i) {
-        output_dims[attributes_.axes[i]] = sizes[i];
-      }
-    } else {
-      output_dims = sizes;
+
+  // Initialize the ROI using the updateRoI lambda
+  roi = updateRoI(attributes_.roi, attributes_.axes, input_dims.size());
+
+  // Initialize the output shape using the initOutputShape lambda
+  std::vector<int64_t> output_shape = initOutputShape(input_dims, attributes_.scales, sizes, attributes_.axes);
+  scales = attributes_.scales;
+
+  if (attributes_.scales.empty()) {
+    // Calculate scales if not provided
+    scales.resize(input_dims.size());
+    for (size_t i = 0; i < input_dims.size(); ++i) {
+      scales[i] = (input_dims[i] == 0 ? 1.0f : static_cast<float>(output_shape[i]) / input_dims[i]);
     }
-  } else {
-    if (scales.empty()) {
-      return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Resize requires either scales or sizes.");
-    } else {
-      output_dims.resize(input_dims.size());
-      for (size_t i = 0; i < input_dims.size(); ++i) {
-        output_dims[i] = static_cast<int64_t>(std::round(input_dims[i] * scales[i]));
-      }
 
-      if (attributes_.keepAspectRatioPolicy != KeepAspectRatioPolicy::Stretch) {
-        // Adjust output shape based on keepAspectRatioPolicy
-        float scale_in_policy;
-        if (attributes_.keepAspectRatioPolicy == KeepAspectRatioPolicy::NotLarger) {
-          if (!attributes_.axes.empty()) {
-            scale_in_policy = *std::min_element(attributes_.axes.begin(), attributes_.axes.end(),
-                                                [&](int64_t a, int64_t b) { return scales[a] < scales[b]; });
-          } else {
-            scale_in_policy = *std::min_element(scales.begin(), scales.end());
-          }
-        } else if (attributes_.keepAspectRatioPolicy == KeepAspectRatioPolicy::NotSmaller) {
-          if (!attributes_.axes.empty()) {
-            scale_in_policy = *std::max_element(attributes_.axes.begin(), attributes_.axes.end(),
-                                                [&](int64_t a, int64_t b) { return scales[a] > scales[b]; });
-          } else {
-            scale_in_policy = *std::max_element(scales.begin(), scales.end());
-          }
-        } else {
-          return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Unsupported KeepAspectRatioPolicy");
-        }
-
-        // Update scales to maintain aspect ratio
-        std::vector<float> updated_scales = scales;
-        std::fill(updated_scales.begin(), updated_scales.end(), 1.0f);
-
-        if (!attributes_.axes.empty()) {
-          for (size_t i = 0; i < attributes_.axes.size(); ++i) {
-            updated_scales[attributes_.axes[i]] = scale_in_policy;
-            output_dims[attributes_.axes[i]] = static_cast<int64_t>(std::round(input_dims[attributes_.axes[i]] * scale_in_policy));
-          }
-        } else {
-          for (size_t i = 0; i < updated_scales.size(); ++i) {
-            updated_scales[i] = scale_in_policy;
-            output_dims[i] = static_cast<int64_t>(std::round(input_dims[i] * scale_in_policy));
-          }
-        }
-
-        scales = updated_scales;
-      }
+    if (attributes_.keepAspectRatioPolicy != KeepAspectRatioPolicy::Stretch) {
+      // Adjust output shape based on keepAspectRatioPolicy
+      output_shape = adjustOutputShape(input_dims, scales, attributes_);
     }
   }
 
+  // Assign output dimensions based on the output_shape and scales
+  output_dims.resize(input_dims.size());
+  for (size_t i = 0; i < input_dims.size(); ++i) {
+    output_dims[i] = static_cast<int64_t>(std::round(input_dims[i] * scales[i]));
+  }
   // Create output tensor
   TensorShape output_shape_obj(output_dims);
   Tensor* output_tensor = context.Output(0, output_shape_obj);
@@ -582,45 +951,27 @@ Status Resize::ComputeInternal(ComputeContext& context) const {
     return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Output tensor is null");
   }
 
-  // Initialize ResizeProgram
-  ResizeProgram program;
-  program.attributes_ = attributes_;
-
-  // Create ShaderHelper
-  ShaderHelper shader(program, /* program_metadata */ ProgramMetadata(), /* device */ context.device(),
-                      /* limits */ context.limits(),
-                      /* dispatch_group_size_x */ static_cast<uint32_t>((output_shape_obj.Size() + 63) / 64),
-                      /* dispatch_group_size_y */ 1,
-                      /* dispatch_group_size_z */ 1);
-
-  ORT_RETURN_IF_ERROR(shader.Init());
-
-  // Generate shader code
-  ORT_RETURN_IF_ERROR(program.GenerateShaderCode(shader));
-
-  // Create ProgramInfo
-  ProgramInfo program_info;
-  program_info.name = "Resize";
-  program_info.shader_code = shader.GetCode();
-
   // Calculate output size
   size_t output_size = output_shape_obj.Size();
 
-  // Set dispatch group size (assuming workgroup size of 64)
-  program_info.dispatch_group = {static_cast<uint32_t>((output_size + 63) / 64), 1, 1};
-
-  // Set uniforms
-  program_info.uniforms.push_back({DataType::UINT32, {static_cast<uint32_t>(output_size)}});
-  program_info.uniforms.push_back({DataType::FLOAT, scales});
-  program_info.uniforms.push_back({DataType::FLOAT, roi});
-  program_info.uniforms.push_back({DataType::UINT32, input_dims});
-  program_info.uniforms.push_back({DataType::UINT32, output_dims});
-
-  // Define outputs
-  program_info.outputs.push_back({output_shape_obj, input_tensor->DataType()});
+  // Initialize ResizeProgram
+  ResizeProgram program;
+  program.attributes_ = attributes_;
+  program.attributes_.output_shape = output_tensor->Shape();
+  program.attributes_.input_shape = input_tensor->Shape();
+  program.attributes_.scales = scales;
+  program.attributes_.roi = roi;
+  program.attributes_.input_is_fp16 = input_tensor->IsDataType<MLFloat16>();
+  program.AddInputs({{input_tensor, ProgramTensorMetadataDependency::TypeAndRank}})
+      .AddOutput({output_tensor, ProgramTensorMetadataDependency::Rank})
+      .SetDispatchGroupSize(static_cast<uint32_t>((output_size + 63) / 64) /* workgroup size */, 1, 1)
+      .CacheHint(std::to_string(attributes_.opset) +
+                 "|" + std::to_string(std::hash<std::vector<float>>{}(scales)) +
+                 "|" + std::to_string(std::hash<std::vector<int64_t>>{}(sizes)))
+      .AddUniformVariables({{static_cast<uint32_t>(output_size)}, {std::move(scales)}, {std::move(roi)}});
 
   // Run the shader program
-  return context.RunProgram(program_info);
+  return context.RunProgram(program);
 }
 
 }  // namespace webgpu

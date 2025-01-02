@@ -47,7 +47,10 @@ enum class NearestMode {
 // Structure to hold Resize attributes
 struct ResizeAttributes {
   int antialias;
+  int opset;
   std::vector<int64_t> axes;
+  std::vector<float> roi;
+  std::vector<float> scales;
   CoordinateTransformMode coordinateTransformMode;
   float cubicCoeffA;
   bool excludeOutside;
@@ -55,26 +58,29 @@ struct ResizeAttributes {
   KeepAspectRatioPolicy keepAspectRatioPolicy;
   Mode mode;
   NearestMode nearestMode;
+  TensorShape output_shape;
+  TensorShape input_shape;
+  bool input_is_fp16;
 };
 
 // Resize Program Class
 class ResizeProgram : public Program<ResizeProgram> {
  public:
-  ResizeProgram() : Program("Resize", ProgramMetadata()) {}
+  explicit ResizeProgram();
 
   Status GenerateShaderCode(ShaderHelper& sh) const override;
 
   // Attributes
   ResizeAttributes attributes_;
+  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES({"output_size", ProgramUniformVariableDataType::Uint32},
+                                          {"scale", ProgramUniformVariableDataType::Float32},
+                                          {"roi", ProgramUniformVariableDataType::Float32});
 
- private:
   // Helper methods for shader code generation
-  std::string CoordinateTransformModeToWGSL(CoordinateTransformMode mode) const;
-  std::string KeepAspectRatioPolicyToWGSL(KeepAspectRatioPolicy policy) const;
-  std::string ModeToWGSL(Mode mode) const;
-  std::string NearestModeToWGSL(NearestMode mode, int opset_version) const;
-
-  // Additional helper functions can be added here
+  static std::string CoordinateTransformModeToWGSL(CoordinateTransformMode mode);
+  static std::string KeepAspectRatioPolicyToWGSL(KeepAspectRatioPolicy policy);
+  static std::string ModeToWGSL(Mode mode);
+  static std::string NearestModeToWGSL(NearestMode mode, int opset_version);
 };
 
 // Resize Kernel Class
@@ -85,7 +91,6 @@ class Resize : public WebGpuKernel {
 
  private:
   ResizeAttributes attributes_;
-  int opset_;
 
   // Helper functions
   void ValidateInputs(const ComputeContext& context,
