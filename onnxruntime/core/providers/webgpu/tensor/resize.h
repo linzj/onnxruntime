@@ -48,7 +48,7 @@ enum class NearestMode {
 struct ResizeAttributes {
   int antialias;
   int opset;
-  std::vector<int64_t> axes;
+  TensorShapeVector axes;
   std::vector<float> roi;
   std::vector<float> scales;
   CoordinateTransformMode coordinateTransformMode;
@@ -99,7 +99,6 @@ class Resize : public WebGpuKernel {
                       std::vector<float>& scales,
                       std::vector<int64_t>& sizes,
                       std::vector<float>& roi) const;
-  std::vector<float> UpdateScales(const std::vector<float>& scales, const std::vector<int64_t>& axes, int rank) const;
   void ValidateScales(const std::vector<float>& scales, const ResizeAttributes& attributes) const;
 };
 

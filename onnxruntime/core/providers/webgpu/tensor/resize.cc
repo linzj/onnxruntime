@@ -5,6 +5,7 @@
 #include <cmath>
 #include <tuple>
 #include "core/providers/webgpu/shader_helper.h"
+#include "core/providers/webgpu/webgpu_supported_types.h"
 
 namespace std {
 template <typename T>
@@ -22,6 +23,34 @@ struct hash<std::vector<T>> {
 
 namespace onnxruntime {
 namespace webgpu {
+
+#define WEBGPU_RESIZE_VERSIONED_KERNEL(start, end)            \
+  ONNX_OPERATOR_VERSIONED_KERNEL_EX(                          \
+      Resize,                                                 \
+      kOnnxDomain,                                            \
+      start,                                                  \
+      end,                                                    \
+      kWebGpuExecutionProvider,                               \
+      (*KernelDefBuilder::Create())                           \
+          .TypeConstraint("T", WebGpuSupportedNumberTypes()), \
+      Resize);
+
+#define WEBGPU_RESIZE_KERNEL(version)                         \
+  ONNX_OPERATOR_KERNEL_EX(                                    \
+      Resize,                                                 \
+      kOnnxDomain,                                            \
+      version,                                                \
+      kWebGpuExecutionProvider,                               \
+      (*KernelDefBuilder::Create())                           \
+          .TypeConstraint("T", WebGpuSupportedNumberTypes()), \
+      Resize);
+
+WEBGPU_RESIZE_VERSIONED_KERNEL(10, 10)
+WEBGPU_RESIZE_VERSIONED_KERNEL(11, 12)
+WEBGPU_RESIZE_VERSIONED_KERNEL(13, 17)
+WEBGPU_RESIZE_VERSIONED_KERNEL(18, 18)
+WEBGPU_RESIZE_KERNEL(19)
+
 namespace {
 std::string SetChannelAndBatchIndices(
     const ShaderIndicesHelper& input,
@@ -105,13 +134,13 @@ ResizeAttributes ParseResizeAttributes(const OpKernelInfo& info) {
   ResizeAttributes attrs;
 
   // Parse antialias
-  attrs.antialias = info.GetAttrOrDefault<int>("antialias", 0);
+  attrs.antialias = info.GetAttrOrDefault("antialias", 0.0f);
 
   // Parse optset
   attrs.opset = info.node().SinceVersion();
 
   // Parse axes
-  attrs.axes = info.GetAttrsOrDefault<int64_t>("axes");
+  attrs.axes = info.GetAttrsOrDefault("axes");
 
   // Parse coordinateTransformMode
   attrs.coordinateTransformMode = ParseCoordinateTransformMode(info.GetAttrOrDefault<std::string>("coordinateTransformMode", "half_pixel"));
@@ -120,7 +149,7 @@ ResizeAttributes ParseResizeAttributes(const OpKernelInfo& info) {
   attrs.cubicCoeffA = info.GetAttrOrDefault<float>("cubicCoeffA", -0.75f);
 
   // Parse excludeOutside
-  attrs.excludeOutside = info.GetAttrOrDefault<bool>("excludeOutside", false);
+  attrs.excludeOutside = info.GetAttrOrDefault("excludeOutside", 0.0f) != 0.0f;
 
   // Parse extrapolationValue
   attrs.extrapolationValue = info.GetAttrOrDefault<float>("extrapolationValue", 0.0f);
@@ -137,7 +166,23 @@ ResizeAttributes ParseResizeAttributes(const OpKernelInfo& info) {
   return attrs;
 }
 
-std::vector<float> UpdateRoI(const std::vector<float>& roi, const std::vector<int64_t>& axes, size_t rank) {
+std::vector<float> UpdateScales(const std::vector<float>& scales, const gsl::span<const int64_t>& axes, int rank) {
+  // Validate axes
+  for (const auto& axis : axes) {
+    if (axis < 0 || axis >= rank) {
+      throw std::invalid_argument("Resize requires axes input values to be positive and less than rank");
+    }
+  }
+
+  // Initialize newScales with 1.0
+  std::vector<float> newScales(rank, 1.0f);
+  for (size_t i = 0; i < axes.size(); ++i) {
+    newScales[axes[i]] = scales[i];
+  }
+  return newScales;
+}
+
+std::vector<float> UpdateRoI(const std::vector<float>& roi, const gsl::span<const int64_t>& axes, size_t rank) {
   std::vector<float> roi_temp(rank * 2, 0);                     // Create a vector with 'rank' 0's followed by 'rank' 1's
   std::vector<float> roi_local = roi.empty() ? roi_temp : roi;  // If roi is empty, use roiTmp, otherwise copy roi
 
@@ -156,7 +201,7 @@ std::vector<float> UpdateRoI(const std::vector<float>& roi, const std::vector<in
 std::vector<int64_t> InitOutputShape(const gsl::span<const int64_t>& input_shape,
                                      const std::vector<float>& scales,
                                      const std::vector<int64_t>& sizes,
-                                     const std::vector<int64_t>& axes) {
+                                     const gsl::span<const int64_t>& axes) {
   std::vector<int64_t> output_shape;
 
   if (!sizes.empty()) {
@@ -239,7 +284,7 @@ std::vector<int64_t> AdjustOutputShape(const gsl::span<const int64_t>& input_sha
 
 }  // namespace
 
-ResizeProgram::ResizeProgram() : Program("Resize", ProgramMetadata()) {}
+ResizeProgram::ResizeProgram() : Program("Resize") {}
 
 // Helper function to validate scales
 void Resize::ValidateScales(const std::vector<float>& scales, const ResizeAttributes& attributes) const {
@@ -272,22 +317,6 @@ void Resize::ValidateScales(const std::vector<float>& scales, const ResizeAttrib
 }
 
 // Helper function to update scales based on axes
-std::vector<float> Resize::UpdateScales(const std::vector<float>& scales, const std::vector<int64_t>& axes, int rank) const {
-  // Validate axes
-  for (const auto& axis : axes) {
-    if (axis < 0 || axis >= rank) {
-      throw std::invalid_argument("Resize requires axes input values to be positive and less than rank");
-    }
-  }
-
-  // Initialize newScales with 1.0
-  std::vector<float> newScales(rank, 1.0f);
-  for (size_t i = 0; i < axes.size(); ++i) {
-    newScales[axes[i]] = scales[i];
-  }
-  return newScales;
-}
-
 // Helper function to validate inputs
 void Resize::ValidateInputs(const ComputeContext& context,
                             const ResizeAttributes& attributes,
