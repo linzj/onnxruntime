@@ -528,7 +528,7 @@ Status ResizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
       additional_impl << "  return ((f32(xResized) + 0.5) / f32(xScale)) - 0.5;\n";
       break;
     default:
-      ORT_RETURN_IF_ERROR(Status(common::ONNXRUNTIME, common::INVALID_ARGUMENT, "Unsupported CoordinateTransformMode in shader generation."));
+      return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Unsupported CoordinateTransformMode in shader generation.");
   }
   additional_impl << "}\n\n";
 
@@ -563,11 +563,11 @@ Status ResizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
                         << "    return xOriginal;\n"
                         << "  }\n";
       } else {
-        ORT_RETURN_IF_ERROR(Status(common::ONNXRUNTIME, common::INVALID_ARGUMENT, "Nearest mode 'simple' not supported for opset >= 11."));
+        return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Nearest mode 'simple' not supported for opset >= 11.");
       }
       break;
     default:
-      ORT_RETURN_IF_ERROR(Status(common::ONNXRUNTIME, common::INVALID_ARGUMENT, "Unsupported NearestMode in shader generation."));
+      return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Unsupported NearestMode in shader generation.");
   }
   additional_impl << "}\n\n";
 
@@ -783,7 +783,7 @@ Status ResizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
                       << "              x211 * dx1 * dy2 * dz2 + x212 * dx1 * dy2 * dz1 + x221 * dx1 * dy1 *dz2 + x222 * dx1 * dy1 * dz1);\n"
                       << "    }";
     } else {
-      ORT_RETURN_IF_ERROR(Status(common::ONNXRUNTIME, common::INVALID_ARGUMENT, "Linear mode only supports input dims 2, 3, 4 and 5 are supported in linear mode."));
+      return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Linear mode only supports input dims 2, 3, 4 and 5 are supported in linear mode.");
     }
   } else if (attributes_.mode == Mode::Cubic) {
     const bool is_2d = input_shape_length == 2;
@@ -867,7 +867,7 @@ Status ResizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
                     << "  return colCubicInterpolation(input_indices, output_indices);\n"
                     << "}\n\n";
   } else {
-    ORT_RETURN_IF_ERROR(Status(common::ONNXRUNTIME, common::INVALID_ARGUMENT, "Unsupported interpolation mode."));
+    return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Unsupported interpolation mode.");
   }
 
   // Inject the additional implementations into the shader
@@ -904,7 +904,7 @@ Status ResizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
     } else if (attributes_.mode == Mode::Cubic) {
       main_body << "  " << output.SetByIndices("global_idx", "bicubicInterpolation(output_indices)") << ";\n";
     } else {
-      ORT_RETURN_IF_ERROR(Status(common::ONNXRUNTIME, common::INVALID_ARGUMENT, "Unsupported resize mode."));
+      return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Unsupported resize mode.");
     }
   }
 
