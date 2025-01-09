@@ -983,7 +983,7 @@ Status Resize::ComputeInternal(ComputeContext& context) const {
   program.attributes_.roi = roi;
   program.attributes_.input_is_fp16 = input_tensor->IsDataType<MLFloat16>();
   program.AddInputs({{input_tensor, ProgramTensorMetadataDependency::TypeAndRank}})
-      .AddOutput({output_tensor, ProgramTensorMetadataDependency::Rank})
+      .AddOutput({output_tensor, ProgramTensorMetadataDependency::None})
       .SetDispatchGroupSize(static_cast<uint32_t>((output_size + 63) / 64) /* workgroup size */, 1, 1)
       .CacheHint(std::to_string(attributes_.opset) +
                  "|" + std::to_string(std::hash<std::vector<float>>{}(scales)) +

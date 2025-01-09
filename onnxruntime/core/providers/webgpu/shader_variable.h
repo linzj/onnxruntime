@@ -122,6 +122,10 @@ class ShaderIndicesHelper {
   template <typename TIdx>
   inline std::string IndicesGet(std::string_view indices_var, const TIdx& idx_expr) const;
 
+  // Shape of the variable.
+  std::string Shape() const;
+  std::string Stride() const;
+
  protected:
   ORT_DISALLOW_COPY_AND_ASSIGNMENT(ShaderIndicesHelper);
 
@@ -189,6 +193,9 @@ class ShaderVariableHelper : public ShaderIndicesHelper {
   template <typename TOffset>
   inline std::string GetByOffset(TOffset&& offset) const;
 
+  std::string_view StorageType() const;
+  std::string_view ValueType() const;
+
  private:
   ORT_DISALLOW_COPY_AND_ASSIGNMENT(ShaderVariableHelper);
 
@@ -196,8 +203,6 @@ class ShaderVariableHelper : public ShaderIndicesHelper {
 
   std::string GetByOffsetImpl(std::string_view offset) const;
   std::string SetByOffsetImpl(std::string_view offset, std::string_view value) const;
-  std::string_view StorageType() const;
-  std::string_view ValueType() const;
   std::string_view ElementType() const;
 
   friend class ShaderHelper;

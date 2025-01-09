@@ -1,13 +1,25 @@
 // conv.cc
 #include "conv.h"
 #include "core/providers/webgpu/shader_helper.h"
-#include <cmath>
+#include "core/providers/webgpu/tensor/transpose.h"
 #include <string>
 
 namespace onnxruntime {
 namespace webgpu {
 
 namespace {
+
+// Helper function to get the maximum number of vector components
+uint32_t GetMaxComponents(int64_t size) {
+  // We cannot use vec3 type since it has alignment of 16 bytes
+  if (size % 4 == 0) {
+    return 4;
+  } else if (size % 2 == 0) {
+    return 2;
+  }
+  return 1;
+}
+
 Status ParseInternalActivationAttributes(const OpKernelInfo& info, InternalActivationAttributes& attrib) {
   Status status;
   std::string activation_str;
@@ -52,7 +64,10 @@ ConvAttributes ParseConvAttributes(const OpKernelInfo& info) {
   convAttrs.autoPad = static_cast<AutoPadKind>(static_cast<uint8_t>(info.GetAttrOrDefault<float>("autoPad", 0.0f)));
 
   // Parse dilations
-  convAttrs.dilations = info.GetAttrsOrDefault("dilations", {});
+  gsl::span<const uint32_t> dilations_span;
+  if (info.GetAttrsAsSpan("dilations", dilations_span).IsOK()) {
+    convAttrs.dilations = std::vector<uint32_t>(dilations_span.begin(), dilations_span.end());
+  }
 
   // Parse kernelShape
   convAttrs.kernelShape = info.GetAttrsOrDefault("kernelShape", {});
@@ -77,59 +92,486 @@ ConvAttributes ParseConvAttributes(const OpKernelInfo& info) {
   return convAttrs;
 }
 
+// Helper function to get adjusted permutation
+TensorShapeVector GetAdjustedPerm(size_t inputRank, const TensorShapeVector& permAttr) {
+  if (permAttr.empty() || permAttr.size() != inputRank) {
+    TensorShapeVector reversedPerm(inputRank);
+    std::iota(reversedPerm.rbegin(), reversedPerm.rend(), 0);
+    return reversedPerm;
+  }
+  return permAttr;
+}
+
+// Helper function to get output shape based on permutation
+TensorShapeVector GetOutputShape(const TensorShapeVector& inputShape, const TensorShapeVector& perm) {
+  TensorShapeVector outputShape(inputShape.size());
+  for (size_t i = 0; i < perm.size(); ++i) {
+    outputShape[i] = inputShape[perm[i]];
+  }
+  return outputShape;
+}
+
+// Helper function to check if transpose is equivalent to a reshape
+bool IsTransposeReshape(const TensorShapeVector& perm, const gsl::span<const int64_t>& shape) {
+  int64_t lastPermutedAxis = 0;
+  for (size_t i = 0; i < perm.size(); ++i) {
+    if (shape[perm[i]] == 1) {
+      continue;
+    }
+    if (perm[i] < lastPermutedAxis) {
+      return false;
+    }
+    lastPermutedAxis = perm[i];
+  }
+  return true;
+}
+
+// Helper function to check if arrays are equal
+bool AreEqual(const TensorShapeVector& arr1, const std::vector<int>& arr2) {
+  if (arr1.size() != arr2.size()) return false;
+  for (size_t i = 0; i < arr1.size(); i++) {
+    if (arr1[i] != arr2[i]) return false;
+  }
+  return true;
+}
+
+// Helper function to convert output batch indices to input batch indices
+std::string ConvertOutputBatchIndicesToInputBatchIndices(
+    const std::string& target_indices_name,
+    const ShaderVariableHelper& input_var,
+    size_t input_batch_rank,
+    size_t output_batch_rank,
+    const std::string& batch_indices_name) {
+  // Assume output_batch_rank >= input_batch_rank, the first output_batch_rank - input_batch_rank of
+  // output_batch_rank should be ignored
+  const size_t extending_input_rank = output_batch_rank - input_batch_rank;
+  std::stringstream code;
+
+  for (size_t i = 0; i < input_batch_rank; ++i) {
+    code << "if (" << GetElementAt(input_var.Shape(), i, input_var.Rank()) << " != 1) {\n"
+         << "  " << input_var.IndicesSet(target_indices_name, i, GetElementAt(batch_indices_name, i + extending_input_rank, output_batch_rank)) << "\n"
+         << "} else {\n"
+         << "  " << input_var.IndicesSet(target_indices_name, i, "0") << "\n"
+         << "}\n";
+  }
+
+  return code.str();
+}
+
+// Helper function to squeeze shape
+auto SqueezeShape(const gsl::span<const int64_t>& shape, const gsl::span<const size_t>& adjusted_perm, InlinedVector<int64_t>& new_shape, InlinedVector<int64_t>& new_perm) {
+  for (size_t i = 0; i < shape.size(); ++i) {
+    if (shape[i] != 1) {
+      new_shape.push_back(shape[i]);
+    }
+    if (shape[adjusted_perm[i]] != 1) {
+      new_perm.push_back(adjusted_perm[i]);
+    }
+  }
+}
+
 // The program creator
-std::unique_ptr<details::ProgramWrapper> CreateTransposeProgram(
-    const Tensor* inputTensor, const std::vector<int64_t>& permAttr) {
-  ORT_THROW("CreateTransposeProgram is not implemented yet.");
+Status RunTransposeProgram(ComputeContext& context, const gsl::span<const size_t>& permutations, Tensor*& output_tensor) {
+  const auto* input_tensor = context.Input(0);
+  const TensorShape& input_shape = input_tensor->Shape();
+
+  // Compute output shape based on permutations
+  TensorShapeVector output_dims(input_shape.NumDimensions());
+  for (size_t i = 0; i < permutations.size(); ++i) {
+    output_dims[i] = input_shape[permutations[i]];
+  }
+  TensorShape output_shape(output_dims);
+  output_tensor = context.Output(0, output_shape);
+
+  // Compute use_shared flag based on shape and permutations
+  InlinedVector<int64_t> new_shape{};
+  InlinedVector<int64_t> new_perm{};
+  SqueezeShape(input_shape.GetDims(), permutations, new_shape, new_perm);
+  const bool channels_last = new_perm == InlinedVector<int64_t>({2, 3, 1});
+  const bool channels_first = new_perm == InlinedVector<int64_t>({3, 1, 2});
+  const bool use_shared = (new_shape.size() == 2 && new_perm[0] > new_perm[1]) || channels_last || channels_first;
+
+  // Handle shape transformations for shared memory case
+  auto new_input_shape = input_shape;
+  TensorShape new_output_shape(output_dims);
+  if (use_shared) {
+    new_input_shape = channels_last
+                          ? TensorShape({new_shape[0], new_shape[1] * new_shape[2]})
+                      : channels_first
+                          ? TensorShape({new_shape[0] * new_shape[1], new_shape[2]})
+                          : new_shape;
+    new_output_shape = TensorShape({new_input_shape[1], new_input_shape[0]});
+  }
+
+  // Create and configure the transpose program
+  TransposeProgram program{permutations, use_shared};
+
+  // Set workgroup sizes based on tile size
+  if (use_shared) {
+    program.SetWorkgroupSize(Transpose::TILE_SIZE, Transpose::TILE_SIZE, 1);
+  }
+
+  // Configure program inputs/outputs
+  program
+      .CacheHint(absl::StrJoin(permutations, "-"))
+      .AddInputs({{input_tensor, ProgramTensorMetadataDependency::TypeAndRank, new_input_shape, 1}})
+      .AddOutputs({{output_tensor, ProgramTensorMetadataDependency::None, new_output_shape, 1}})
+      .AddUniformVariables({
+          {static_cast<uint32_t>(input_tensor->Shape().Size())},
+      });
+
+  // Set dispatch group sizes
+  if (use_shared) {
+    program.SetDispatchGroupSize(
+        static_cast<uint32_t>((new_output_shape[1] + Transpose::TILE_SIZE - 1) / Transpose::TILE_SIZE),
+        static_cast<uint32_t>((new_output_shape[0] + Transpose::TILE_SIZE - 1) / Transpose::TILE_SIZE));
+  } else {
+    program.SetDispatchGroupSize(
+        (input_tensor->Shape().Size() + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE);
+  }
+
+  // Run the program
+  return context.RunProgram(program);
+}
+
+Status RunGroupedConvVectorizeProgram(
+    ComputeContext& context,
+    const std::vector<const Tensor*>& inputs,
+    const ConvAttributes& attributes,
+    const TensorShapeVector& outputShape,
+    Tensor*& output_tensor) {
+  const bool has_bias = inputs.size() > 2;
+  const uint32_t components = GetMaxComponents(outputShape[3]);
+  const uint32_t output_number = GetMaxComponents(outputShape[2]);
+  const size_t output_size = TensorShape(outputShape).Size() / components / output_number;
+
+  std::vector<uint32_t> x_shape = {
+      static_cast<uint32_t>(inputs[0]->Shape()[0]),
+      static_cast<uint32_t>(inputs[0]->Shape()[1]),
+      static_cast<uint32_t>(inputs[0]->Shape()[2]),
+      static_cast<uint32_t>(inputs[0]->Shape()[3] / components)};
+
+  std::vector<uint32_t> w_shape = {
+      static_cast<uint32_t>(inputs[1]->Shape()[0]),
+      static_cast<uint32_t>(inputs[1]->Shape()[1]),
+      static_cast<uint32_t>(inputs[1]->Shape()[2]),
+      static_cast<uint32_t>(inputs[1]->Shape()[3] / components)};
+
+  std::vector<uint32_t> output_shape_in_shader = {
+      static_cast<uint32_t>(outputShape[0]),
+      static_cast<uint32_t>(outputShape[1]),
+      static_cast<uint32_t>(outputShape[2]),
+      static_cast<uint32_t>(outputShape[3] / components)};
+
+  const uint32_t x_number = (output_number - 1) * static_cast<uint32_t>(attributes.strides[1]) + static_cast<uint32_t>(w_shape[1]);
+
+  // Create program
+  auto program = std::make_unique<GroupedConvVectorizeProgram>();
+
+  // Set attributes
+  program->attributes_.convAttributes = attributes;
+  program->attributes_.components = components;
+  program->attributes_.output_number = output_number;
+  program->attributes_.x_number = x_number;
+  program->attributes_.x_shape = x_shape;
+  program->attributes_.w_shape = w_shape;
+  program->attributes_.output_shape = output_shape_in_shader;
+  program->attributes_.has_bias = has_bias;
+  program->attributes_.strides = {
+      static_cast<int32_t>(attributes.strides[0]),
+      static_cast<int32_t>(attributes.strides[1])};
+  program->attributes_.pads = {
+      static_cast<int32_t>(attributes.pads[0]),
+      static_cast<int32_t>(attributes.pads[1])};
+
+  // Configure inputs/outputs
+  program->AddInputs({{inputs[0], ProgramTensorMetadataDependency::TypeAndShape}});
+  program->AddInputs({{inputs[1], ProgramTensorMetadataDependency::None}});
+  if (has_bias) {
+    program->AddInputs({{inputs[2], ProgramTensorMetadataDependency::None}});
+  }
+
+  output_tensor = context.Output(0, TensorShape(outputShape));
+  program->AddOutput({output_tensor, ProgramTensorMetadataDependency::TypeAndShape});
+
+  // Set dispatch sizes
+  program->SetDispatchGroupSize((static_cast<uint32_t>(output_size) + 63) / 64);
+
+  // Add uniforms
+  program->AddUniformVariables({{static_cast<uint32_t>(output_size)},
+                                {program->attributes_.strides},
+                                {program->attributes_.pads},
+                                {attributes.clipMax.has_value() ? attributes.clipMax.value() : 3.4028234663852886e38f},
+                                {attributes.clipMin.has_value() ? attributes.clipMin.value() : -3.4028234663852886e38f},
+                                {attributes.alpha.has_value() ? attributes.alpha.value() : 0.2f},
+                                {attributes.beta.has_value() ? attributes.beta.value() : 0.5f}});
+
+  // Run the program
+  return context.RunProgram(*program);
+}
+
+Status RunGroupedConvProgram(
+    ComputeContext& context,
+    const std::vector<const Tensor*>& inputs,
+    const ConvAttributes& attributes,
+    const TensorShapeVector& output_shape,
+    Tensor*& output_tensor) {
+  const bool has_bias = inputs.size() > 2;
+  const auto* x = inputs[0];
+  const auto* w = inputs[1];
+  const auto* b = has_bias ? inputs[2] : nullptr;
+  const auto& x_shape = x->Shape().AsShapeVector();
+  const auto& w_shape = w->Shape().AsShapeVector();
+
+  const bool is_channel_last = !attributes.nchw;
+  const int64_t output_channels = is_channel_last ? output_shape[3] : output_shape[1];
+  const int64_t output_channels_per_group = output_channels / attributes.group;
+  const uint32_t components = (is_channel_last && output_channels_per_group >= 4) ? GetMaxComponents(output_channels) : 1;
+  const size_t output_size = TensorShape(output_shape).Size() / components;
+
+  // Create program
+  auto program = std::make_unique<GroupedConvProgram>();
+
+  // Set program attributes
+  program->attributes_.convAttributes = attributes;
+  program->attributes_.components = components;
+  program->attributes_.output_channels_per_group = static_cast<uint32_t>(output_channels_per_group);
+  program->attributes_.has_bias = has_bias;
+  program->attributes_.is_channel_last = is_channel_last;
+
+  // Set tensor shapes
+  program->attributes_.x_shape = {
+      static_cast<uint32_t>(x_shape[0]),
+      static_cast<uint32_t>(x_shape[1]),
+      static_cast<uint32_t>(x_shape[2]),
+      static_cast<uint32_t>(x_shape[3])};
+
+  program->attributes_.w_shape = {
+      static_cast<uint32_t>(w_shape[0]),
+      static_cast<uint32_t>(w_shape[1]),
+      static_cast<uint32_t>(w_shape[2]),
+      static_cast<uint32_t>(w_shape[3] / components)};
+
+  program->attributes_.output_shape = {
+      static_cast<uint32_t>(output_shape[0]),
+      static_cast<uint32_t>(output_shape[1]),
+      static_cast<uint32_t>(output_shape[2]),
+      static_cast<uint32_t>(output_shape[3] / components)};
+
+  // Configure program inputs/outputs
+  output_tensor = context.Output(0, TensorShape(output_shape));
+
+  program->AddInputs({{x, ProgramTensorMetadataDependency::TypeAndShape}});
+  program->AddInputs({{w, ProgramTensorMetadataDependency::TypeAndShape}});
+  if (has_bias) {
+    program->AddInputs({{b, ProgramTensorMetadataDependency::None}});
+  }
+  program->AddOutput({output_tensor, ProgramTensorMetadataDependency::None});
+
+  // Set dispatch size
+  program->SetDispatchGroupSize((static_cast<uint32_t>(output_size) + 63) / 64);
+
+  // Add uniform variables
+  program->AddUniformVariables({{static_cast<uint32_t>(output_size)},
+                                {attributes.dilations},
+                                {std::vector<uint32_t>{static_cast<uint32_t>(attributes.strides[0]),
+                                                       static_cast<uint32_t>(attributes.strides[1])}},
+                                {std::vector<uint32_t>{static_cast<uint32_t>(attributes.pads[0]),
+                                                       static_cast<uint32_t>(attributes.pads[1])}},
+                                {static_cast<uint32_t>(output_channels_per_group)},
+                                {attributes.clipMax.has_value() ? attributes.clipMax.value() : 3.4028234663852886e38f},
+                                {attributes.clipMin.has_value() ? attributes.clipMin.value() : -3.4028234663852886e38f},
+                                {attributes.alpha.has_value() ? attributes.alpha.value() : 0.2f},
+                                {attributes.beta.has_value() ? attributes.beta.value() : 0.5f}});
+
+  // Run the program
+  return context.RunProgram(*program);
+}
+
+Status RunNaiveMatmulProgram(
+    ComputeContext& context,
+    const std::vector<const Tensor*>& inputs,
+    const InternalActivationAttributes& activationAttributes,
+    const TensorShapeVector& outputShape,
+    const TensorShapeVector& reshapedOutputShape,
+    bool isChannelsLast,
+    Tensor*& output_tensor) {
+  // Extract dimensions
+  const auto& a_shape = inputs[0]->Shape().GetDims();
+  const auto& b_shape = inputs[1]->Shape().GetDims();
+  const bool has_bias = inputs.size() > 2;
+
+  // Calculate M, N, K dimensions and components
+  const int64_t M = a_shape[a_shape.size() - 2];
+  const int64_t N = b_shape[b_shape.size() - 1];
+  const int64_t K = a_shape[a_shape.size() - 1];
+  const uint32_t components = GetMaxComponents(N);
+  const uint32_t a_components = GetMaxComponents(K);
+  const uint32_t output_number = GetMaxComponents(M);
+
+  // Calculate output dimensions
+  std::vector<uint32_t> outerDims;
+  for (size_t i = 0; i < reshapedOutputShape.size() - 2; ++i) {
+    outerDims.push_back(static_cast<uint32_t>(reshapedOutputShape[i]));
+  }
+  const int64_t batchSize = std::accumulate(outerDims.begin(), outerDims.end(), static_cast<int64_t>(1), std::multiplies<int64_t>());
+  const TensorShapeVector outputShapeInShader{batchSize, M, N};
+  const size_t outputSize = TensorShape(outputShape).Size() / components / output_number;
+
+  // Create and setup program
+  auto program = std::make_unique<NaiveMatmulProgram>();
+  program->attributes_.components = components;
+  program->attributes_.a_components = a_components;
+  program->attributes_.output_number = output_number;
+  program->attributes_.has_bias = has_bias;
+  program->attributes_.isChannelsLast = isChannelsLast;
+  program->attributes_.activationAttributes = activationAttributes;
+  program->attributes_.M = static_cast<uint32_t>(M);
+  program->attributes_.N = static_cast<uint32_t>(N);
+  program->attributes_.K = static_cast<uint32_t>(K);
+  program->attributes_.batchSize = static_cast<uint32_t>(batchSize);
+  program->attributes_.outputShapeSize = static_cast<uint32_t>(outputShape.size());
+
+  // Configure program inputs
+  program->AddInputs({{inputs[0], ProgramTensorMetadataDependency::TypeAndRank}});
+  program->AddInputs({{inputs[1], ProgramTensorMetadataDependency::TypeAndRank}});
+  if (has_bias) {
+    program->AddInputs({{inputs[2], ProgramTensorMetadataDependency::TypeAndRank}});
+  }
+  // allocate a Tensor object for outerDims
+  std::vector<int64_t> outerDimsInt64(outerDims.begin(), outerDims.end());
+  auto outerDimsTensor = context.CreateGPUTensor(inputs[0]->DataType(), TensorShape(outerDimsInt64));
+  program->AddInputs({{&outerDimsTensor, ProgramTensorMetadataDependency::TypeAndRank}});
+
+  // Configure program outputs
+  output_tensor = context.Output(0, TensorShape(outputShape));
+  program->AddOutput({output_tensor, ProgramTensorMetadataDependency::None});
+
+  // Set dispatch size
+  program->SetDispatchGroupSize((static_cast<uint32_t>(outputSize) + 63) / 64);
+
+  // Add uniform variables
+  program->AddUniformVariables({
+      {static_cast<uint32_t>(outputSize)},
+      {static_cast<uint32_t>(M)},
+      {static_cast<uint32_t>(N)},
+      {static_cast<uint32_t>(K)},
+  });
+
+  // Cache the program
+  program->CacheHint(absl::StrJoin(
+      {std::to_string(components), std::to_string(a_components), std::to_string(output_number), std::to_string(isChannelsLast)}, ";"));
+
+  // Run the program
+  return context.RunProgram(*program);
+}
+
+Status RunMatmulProgram(
+    ComputeContext& context,
+    const std::vector<const Tensor*>& inputs,
+    const InternalActivationAttributes& activationAttributes,
+    const TensorShapeVector& outputShape,
+    const TensorShapeVector& reshapedOutputShape,
+    bool isChannelsLast,
+    Tensor*& output_tensor) {
+  ORT_THROW("Matmul is not implemented yet.");
+}
+
+Status RunConv2DMatMulProgram(
+    ComputeContext& context,
+    const std::vector<const Tensor*>& inputs,
+    const ConvAttributes& attributes,
+    const TensorShapeVector& outputShape,
+    int64_t dimAOuter,
+    int64_t dimBOuter,
+    int64_t dimInner,
+    bool hasBias,
+    bool sequentialAccessByThreads,
+    Tensor*& output_tensor) {
+  ORT_THROW("Conv2DMatMul is not implemented yet.");
 }
 
 std::unique_ptr<details::ProgramWrapper> CreateGroupedConvVectorizeProgram(
     const std::vector<const Tensor*>& inputs,
     const ConvAttributes& attributes,
-    const std::vector<int64_t>& outputShape,
-    const std::function<std::vector<int64_t>(const std::vector<int64_t>&)>& squeezeOutputShapeFunction) {
+    const TensorShapeVector& outputShape,
+    const std::function<TensorShapeVector(const TensorShapeVector&)>& squeezeOutputShapeFunction) {
   ORT_THROW("CreateGroupedConvVectorizeProgram is not implemented yet.");
 }
 
 std::unique_ptr<details::ProgramWrapper> CreateGroupedConvProgram(
     const std::vector<const Tensor*>& inputs,
     const ConvAttributes& attributes,
-    const std::vector<int64_t>& outputShape,
-    const std::function<std::vector<int64_t>(const std::vector<int64_t>&)>& squeezeOutputShapeFunction) {
+    const TensorShapeVector& outputShape,
+    const std::function<TensorShapeVector(const TensorShapeVector&)>& squeezeOutputShapeFunction) {
   ORT_THROW("CreateGroupedConvProgram is not implemented yet.");
 }
 
 std::unique_ptr<details::ProgramWrapper> CreateNaiveMatmulProgram(
     const std::vector<const Tensor*>& inputs,
     const InternalActivationAttributes& activationAttributes,
-    const std::vector<int64_t>& outputShape,
-    const std::vector<int64_t>& reshapedOutputShape,
+    const TensorShapeVector& outputShape,
+    const TensorShapeVector& reshapedOutputShape,
     bool isChannelsLast,
-    const std::function<std::vector<int64_t>(const std::vector<int64_t>&)>& squeezeOutputShapeFunction) {
+    const std::function<TensorShapeVector(const TensorShapeVector&)>& squeezeOutputShapeFunction) {
   ORT_THROW("CreateNaiveMatmulProgram is not implemented yet.");
 }
 
 std::unique_ptr<details::ProgramWrapper> CreateMatmulProgram(
     const std::vector<const Tensor*>& inputs,
     const InternalActivationAttributes& activationAttributes,
-    const std::vector<int64_t>& outputShape,
-    const std::vector<int64_t>& reshapedOutputShape,
+    const TensorShapeVector& outputShape,
+    const TensorShapeVector& reshapedOutputShape,
     bool isChannelsLast,
-    const std::function<std::vector<int64_t>(const std::vector<int64_t>&)>& squeezeOutputShapeFunction) {
+    const std::function<TensorShapeVector(const TensorShapeVector&)>& squeezeOutputShapeFunction) {
   ORT_THROW("CreateMatmulProgram is not implemented yet.");
 }
 
 std::unique_ptr<details::ProgramWrapper> CreateConv2DMatMulProgram(
     const std::vector<const Tensor*>& inputs,
     const ConvAttributes& attributes,
-    const std::vector<int64_t>& outputShape,
+    const TensorShapeVector& outputShape,
     int64_t dimAOuter,
     int64_t dimBOuter,
     int64_t dimInner,
     bool hasBias,
     bool sequentialAccessByThreads,
-    const std::function<std::vector<int64_t>(const std::vector<int64_t>&)>& squeezeOutputShapeFunction) {
+    const std::function<TensorShapeVector(const TensorShapeVector&)>& squeezeOutputShapeFunction) {
   ORT_THROW("CreateConv2DMatMulProgram is not implemented yet.");
+}
+
+std::string GetActivationSnippet(
+    const InternalActivationAttributes& attributes,
+    const std::string& valueType,
+    const std::string& baseType = "f32") {
+  switch (attributes.activationAttributes) {
+    case InternalActivationKind::kRelu:
+      return "value = max(value, " + valueType + "(0.0));";
+
+    case InternalActivationKind::kSigmoid:
+      return "value = (" + valueType + "(1.0) / (" + valueType + "(1.0) + exp(-value)));";
+
+    case InternalActivationKind::kClip:
+      return "value = clamp(value, " + valueType + "(" + baseType + "(uniforms.clip_min)), " +
+             valueType + "(" + baseType + "(uniforms.clip_max)));";
+
+    case InternalActivationKind::kHardSigmoid:
+      return "value = max(" + valueType + "(0.0), min(" + valueType + "(1.0), " +
+             baseType + "(uniforms.alpha) * value + " + baseType + "(uniforms.beta)));";
+
+    case InternalActivationKind::kLeakyRelu:
+      return "value = select(" + baseType + "(uniforms.alpha) * value, value, value >= " + valueType + "(0.0));";
+
+    case InternalActivationKind::kTanh:
+      return "let e2x = exp(-2.0 * abs(value));\n"
+             "          value = sign(value) * (1.0 - e2x) / (1.0 + e2x);";
+
+    case InternalActivationKind::kUndef:
+      return "";
+
+    default:
+      ORT_THROW("Unsupported activation");
+  }
 }
 
 }  // namespace
@@ -217,11 +659,7 @@ Status Conv::ComputeInternal(ComputeContext& context) const {
   } else if (input_dims == 4) {
     // 2D Convolution (assuming input shape is [batch_size, channels, height, width])
     // Adjust attributes if necessary (for example, for NHWC/NCHW handling)
-    ConvAttributes adjusted_attributes = attributes_;
-    if (adjusted_attributes.kernelShape.empty()) {
-      // Adjust kernelShape or other attributes if needed for Conv2D
-      // (you can do any adjustments you need here)
-    }
+    ConvAttributes adjusted_attributes = GetAdjustedConvAttributes(attributes_, context);
     return HandleConv2D(context, adjusted_attributes);
   } else {
     // Unsupported input shape for convolution
@@ -295,7 +733,65 @@ void Conv::ValidateInputs(const ComputeContext& context, const ConvAttributes& a
   }
 }
 
-void Conv::CalculateOutputShape(const ComputeContext& context, const ConvAttributes& attributes, std::vector<int64_t>& outputShape) const {
+void Conv::CalculateOutputShape(const ComputeContext& context, const ConvAttributes& attributes, TensorShapeVector& outputShape) const {
+  // Get input tensor
+  const Tensor* inputTensor = context.Input<Tensor>(0);
+  const auto& inputShape = inputTensor->Shape().GetDims();
+
+  // Extract attributes
+  const auto& kernelShape = attributes.kernelShape;
+  const auto& dilations = attributes.dilations;
+  const auto& adjustPads = attributes.pads;
+  const auto& strides = attributes.strides;
+  const bool isChannelsLast = !attributes.nchw;
+
+  // Extract batch size
+  const int64_t batchSize = inputShape[0];
+
+  // Extract input spatial shape (height, width)
+  const size_t spatialRank = inputShape.size() - 2;  // Rank of spatial dimensions (2 for 2D convolution)
+  TensorShapeVector inputSpatialShape;
+  if (isChannelsLast) {
+    inputSpatialShape = TensorShapeVector(inputShape.begin() + 1, inputShape.end() - 1);
+  } else {
+    inputSpatialShape = TensorShapeVector(inputShape.begin() + 2, inputShape.end());
+  }
+
+  // Extract output channels
+  const int64_t outChannels = kernelShape[0];
+
+  // Extract kernel spatial shape (height, width)
+  TensorShapeVector kernelSpatialShape(kernelShape.begin() + 2, kernelShape.end());
+
+  // Calculate dilated kernel shape
+  TensorShapeVector dilatedKernelShape;
+  for (size_t i = 0; i < kernelSpatialShape.size(); ++i) {
+    dilatedKernelShape.push_back(kernelSpatialShape[i] + (kernelSpatialShape[i] - 1) * (dilations[i] - 1));
+  }
+
+  // Calculate input spatial shape with padding
+  TensorShapeVector inputSpatialShapeWithPad;
+  for (size_t i = 0; i < inputSpatialShape.size(); ++i) {
+    inputSpatialShapeWithPad.push_back(inputSpatialShape[i] + adjustPads[i] + adjustPads[i + spatialRank]);
+  }
+
+  // Calculate output spatial shape
+  TensorShapeVector outputSpatialShape;
+  for (size_t i = 0; i < inputSpatialShapeWithPad.size(); ++i) {
+    outputSpatialShape.push_back(
+        (inputSpatialShapeWithPad[i] - dilatedKernelShape[i] + strides[i]) / strides[i]);
+  }
+
+  // Construct final output shape
+  outputShape.clear();
+  outputShape.push_back(batchSize);  // Batch size
+  if (isChannelsLast) {
+    outputShape.insert(outputShape.end(), outputSpatialShape.begin(), outputSpatialShape.end());  // Spatial dimensions
+    outputShape.push_back(outChannels);                                                           // Output channels
+  } else {
+    outputShape.push_back(outChannels);
+    outputShape.insert(outputShape.end(), outputSpatialShape.begin(), outputSpatialShape.end());  // Spatial dimensions
+  }
 }
 
 // HandleConv1D - Convolution for 1D inputs (e.g., [batch_size, channels, width])
@@ -323,7 +819,7 @@ Status Conv::HandleConv2D(ComputeContext& context, const ConvAttributes& attribu
   const bool isChannelsLast = attributes.nchw;  // Assuming 'nchw' corresponds to 'NHWC' format
 
   // Calculate output shape
-  std::vector<int64_t> outputShape;
+  TensorShapeVector outputShape;
   CalculateOutputShape(context, attributes, outputShape);
 
   // Get input tensors
@@ -337,11 +833,12 @@ Status Conv::HandleConv2D(ComputeContext& context, const ConvAttributes& attribu
     if (isChannelsLast) {
       if (!attributes.wT) {
         // Create and run the transpose program
-        auto transposeProgram = CreateTransposeProgram(weightTensor, {1, 0});  // Assuming permAttr = [1, 0]
-        ORT_RETURN_IF_ERROR(context.RunProgram(*transposeProgram));
+        Tensor* output_tensor;
+        std::vector<size_t> perm = {1, 0};                                       // Define permutation
+        ORT_RETURN_IF_ERROR(RunTransposeProgram(context, perm, output_tensor));  // Use the new interface
 
         // Store the transposed weight in attributes.wT
-        attributes.wT = transposeProgram->Outputs()[0].tensor;
+        attributes.wT = output_tensor;
       }
       convInputs.push_back(*attributes.wT);
     } else {
@@ -353,17 +850,19 @@ Status Conv::HandleConv2D(ComputeContext& context, const ConvAttributes& attribu
 
     // Check if grouped convolution with vectorization is enabled
     std::string_view adaptor_arch = context.AdapterInfo().architecture;
-    bool enableGroupedConvVectorize = adaptor_arch != "ampere";
-    if (enableGroupedConvVectorize && isChannelsLast &&
+    bool enable_grouped_conv_vectorize = adaptor_arch != "ampere";
+    if (enable_grouped_conv_vectorize && isChannelsLast &&
         weightTensor->Shape()[0] == attributes.group && weightTensor->Shape()[1] == 1 &&
         attributes.dilations[0] == 1 && attributes.dilations[1] == 1) {
-      auto groupedConvVectorizeProgram = CreateGroupedConvVectorizeProgram(
-          convInputs, attributes, outputShape, /*squeezeOutputShapeFunction=*/nullptr);
-      return context.RunProgram(*groupedConvVectorizeProgram);
+      Tensor* output_tensor;
+      ORT_RETURN_IF_ERROR(RunGroupedConvVectorizeProgram(
+          context, convInputs, attributes, outputShape, output_tensor));
+      return Status::OK();
     } else {
-      auto groupedConvProgram = CreateGroupedConvProgram(
-          convInputs, attributes, outputShape, /*squeezeOutputShapeFunction=*/nullptr);
-      return context.RunProgram(*groupedConvProgram);
+      Tensor* output_tensor;
+      ORT_RETURN_IF_ERROR(RunGroupedConvProgram(
+          context, convInputs, attributes, outputShape, output_tensor));
+      return Status::OK();
     }
   }
 
@@ -393,55 +892,59 @@ Status Conv::HandleConv2D(ComputeContext& context, const ConvAttributes& attribu
   if (sameSize || is1x1Conv) {
     // Perform convolution using matrix multiplication
     const int64_t batch = outputShape[0];
-    Tensor xReshaped;
-    Tensor wReshaped;
-    std::vector<int64_t> matmulOutputShape;
-    std::vector<const Tensor*> matmulInputs;
+    TensorShapeVector xReshaped;
+    TensorShapeVector wReshaped;
+    TensorShapeVector matmulOutputShape;
+    std::vector<TensorShapeVector> matmulInputs;
 
     if (isChannelsLast) {
       if (!attributes.wT) {
         // Create and run the transpose program
-        auto transposeProgram = CreateTransposeProgram(weightTensor, {1, 0});  // Assuming permAttr = [1, 0]
-        ORT_RETURN_IF_ERROR(context.RunProgram(*transposeProgram));
+        std::vector<size_t> perm = {1, 0};  // Define permutation
+        Tensor* output_tensor;
+
+        ORT_THROW_IF_ERROR(RunTransposeProgram(context, perm, output_tensor));  // Assuming permAttr = [1, 0]
 
         // Store the transposed weight in attributes.wT
-        attributes.wT = transposeProgram->Outputs()[0].tensor;
+        attributes.wT = output_tensor;
       }
 
       if (sameSize) {
         const int64_t sharedDim = inputHeight * inputWidth * inputChannels;
-        xReshaped = inputTensor->ReshapeToTensor({1, batch, sharedDim});
-        wReshaped = attributes.wT.value()->ReshapeToTensor({1, sharedDim, outChannels});
+        xReshaped = {1, batch, sharedDim};
+        wReshaped = {1, sharedDim, outChannels};
         matmulOutputShape = {1, batch, outChannels};
       } else {
-        xReshaped = inputTensor->ReshapeToTensor({batch, inputHeight * inputWidth, inputChannels});
-        wReshaped = attributes.wT.value()->ReshapeToTensor({1, inputChannels, outChannels});
+        xReshaped = {batch, inputHeight * inputWidth, inputChannels};
+        wReshaped = {1, inputChannels, outChannels};
         matmulOutputShape = {batch, outHeight * outWidth, outChannels};
       }
-      matmulInputs.push_back(&xReshaped);
-      matmulInputs.push_back(&wReshaped);
+      matmulInputs.push_back(xReshaped);
+      matmulInputs.push_back(wReshaped);
     } else {
-      xReshaped = inputTensor->ReshapeToTensor({batch, inputChannels, inputHeight * inputWidth});
-      wReshaped = weightTensor->ReshapeToTensor({1, outChannels, inputChannels});
+      xReshaped = {batch, inputChannels, inputHeight * inputWidth};
+      wReshaped = {1, outChannels, inputChannels};
       matmulOutputShape = {batch, outChannels, outHeight * outWidth};
-      matmulInputs.push_back(&wReshaped);
-      matmulInputs.push_back(&xReshaped);
+      matmulInputs.push_back(wReshaped);
+      matmulInputs.push_back(xReshaped);
     }
 
     if (hasBias) {
-      matmulInputs.push_back(biasTensor);
+      matmulInputs.push_back(biasTensor->Shape().AsShapeVector());
     }
 
     const int64_t N = matmulOutputShape[2];
-    const int64_t K = matmulInputs[0]->Shape().GetDims().back();
+    const int64_t K = matmulInputs[0].back();
     if (N < 8 && K < 8) {
-      auto naiveMatmulProgram = CreateNaiveMatmulProgram(
-          matmulInputs, attributes, outputShape, matmulOutputShape, isChannelsLast, /*squeezeOutputShapeFunction=*/nullptr);
-      return context.RunProgram(*naiveMatmulProgram);
+      Tensor* output_tensor;
+      ORT_RETURN_IF_ERROR(RunNaiveMatmulProgram(
+          context, matmulInputs, attributes, outputShape, matmulOutputShape, isChannelsLast, output_tensor));
+      return Status::OK();
     } else {
-      auto matmulProgram = CreateMatmulProgram(
-          matmulInputs, attributes, outputShape, matmulOutputShape, isChannelsLast, /*squeezeOutputShapeFunction=*/nullptr);
-      return context.RunProgram(*matmulProgram);
+      Tensor* output_tensor;
+      ORT_RETURN_IF_ERROR(RunMatmulProgram(
+          context, matmulInputs, attributes, outputShape, matmulOutputShape, isChannelsLast, output_tensor));
+      return Status::OK();
     }
   }
 
@@ -450,11 +953,11 @@ Status Conv::HandleConv2D(ComputeContext& context, const ConvAttributes& attribu
 
   // STEP 1: Transpose weight
   if (!attributes.wT) {
-    auto transposeProgram = CreateTransposeProgram(weightTensor, {1, 0});  // Assuming permAttr = [1, 0]
-    ORT_RETURN_IF_ERROR(context.RunProgram(*transposeProgram));
+    Tensor* output_tensor;
+    ORT_THROW_IF_ERROR(RunTransposeProgram(context, std::vector<std::size_t>({1, 0}), output_tensor));  // Assuming permAttr = [1, 0]
 
     // Store the transposed weight in attributes.wT
-    attributes.wT = transposeProgram->Outputs()[0].tensor;
+    attributes.wT = output_tensor;
   }
 
   // STEP 2: Prepare reshaped inputs
@@ -468,9 +971,378 @@ Status Conv::HandleConv2D(ComputeContext& context, const ConvAttributes& attribu
   const int64_t dimBOuter = isChannelsLast ? outChannels : outHeight * outWidth;
   const int64_t dimInner = weightHeight * weightWidth * inputChannels;
 
-  auto conv2DMatMulProgram = CreateConv2DMatMulProgram(
-      convInputs, attributes, outputShape, dimAOuter, dimBOuter, dimInner, hasBias, sequentialAccessByThreads, /*squeezeOutputShapeFunction=*/nullptr);
-  return context.RunProgram(*conv2DMatMulProgram);
+  Tensor* output_tensor;
+  ORT_RETURN_IF_ERROR(RunConv2DMatMulProgram(
+      context, convInputs, attributes, outputShape, dimAOuter, dimBOuter, dimInner, hasBias, sequentialAccessByThreads, output_tensor));
+  return Status::OK();
+}
+
+ConvAttributes Conv::GetAdjustedConvAttributes(const ConvAttributes& attributes, const ComputeContext& context) const {
+  ConvAttributes adjustedAttributes = attributes;
+
+  // Adjust kernelShape if not well specified
+  auto kernelShape = attributes.kernelShape;
+  if (kernelShape.size() < context.Input(1)->Shape().NumDimensions() - 2) {
+    // Fill missing dimensions with 0
+    kernelShape.resize(context.Input(1)->Shape().NumDimensions() - 2, 0);
+  }
+
+  // Infer kernelShape from the weight tensor dimensions
+  for (size_t i = 2; i < context.Input(1)->Shape().NumDimensions(); ++i) {
+    if (kernelShape[i - 2] == 0) {
+      kernelShape[i - 2] = context.Input(1)->Shape()[i];
+    }
+  }
+
+  // Adjust pads based on autoPad
+  TensorShapeVector pads = attributes.pads;
+  AdjustPadsBasedOnAutoPad(
+      context.Input(0)->Shape().AsShapeVector(),
+      attributes.strides,
+      TensorShapeVector(attributes.dilations.begin(), attributes.dilations.end()),
+      kernelShape,
+      pads,
+      attributes.nchw,  // Assuming 'nchw' corresponds to 'NHWC' format
+      attributes.autoPad);
+
+  // Update adjustedAttributes with new kernelShape and pads
+  adjustedAttributes.kernelShape = kernelShape;
+  adjustedAttributes.pads = pads;
+
+  return adjustedAttributes;
+}
+
+void Conv::AdjustPadsBasedOnAutoPad(
+    const TensorShapeVector& inputDims,
+    const TensorShapeVector& strides,
+    const TensorShapeVector& dilations,
+    const TensorShapeVector& kernelShape,
+    TensorShapeVector& pads,
+    bool isChannelsLast,
+    AutoPadKind autoPad) const {
+  if (autoPad == AutoPadKind::kNotSet) {
+    return;
+  }
+
+  // Validate input dimensions
+  if (pads.size() != 2 * (inputDims.size() - 2)) {
+    ORT_THROW("Length of pads should be twice the length of data dimensions.");
+  }
+
+  if (strides.size() != inputDims.size() - 2) {
+    ORT_THROW("Length of strides should be the length of data dimensions.");
+  }
+
+  if (kernelShape.size() != inputDims.size() - 2) {
+    ORT_THROW("Length of kernel shapes should be the length of data dimensions.");
+  }
+
+  // Adjust pads for each dimension
+  for (size_t dim = 0; dim < inputDims.size() - 2; ++dim) {
+    AdjustPadAndReturnShape(
+        inputDims[dim + (isChannelsLast ? 1 : 2)],
+        strides[dim],
+        dilations[dim],
+        kernelShape[dim],
+        pads,
+        dim,
+        dim + inputDims.size() - 2,
+        autoPad);
+  }
+}
+
+int64_t Conv::AdjustPadAndReturnShape(
+    int64_t inputSize,
+    int64_t stride,
+    int64_t dilation,
+    int64_t kernelSize,
+    TensorShapeVector& pads,
+    size_t padBeginIndex,
+    size_t padEndIndex,
+    AutoPadKind autoPad) const {
+  const int64_t dkernel = dilation * (kernelSize - 1) + 1;
+
+  if (autoPad != AutoPadKind::kNotSet) {
+    switch (autoPad) {
+      case AutoPadKind::kValid:
+        // No padding
+        pads[padBeginIndex] = 0;
+        pads[padEndIndex] = 0;
+        return (inputSize - dkernel) / stride + 1;
+
+      case AutoPadKind::kSameUpper:
+      case AutoPadKind::kSameLower:
+        if (dilation != 1) {
+          ORT_THROW("Dilation not supported for SAME_UPPER or SAME_LOWER.");
+        } else {
+          const int64_t legacyTargetSize = (inputSize + stride - 1) / stride;
+          const int64_t padNeeded = (legacyTargetSize - 1) * stride + kernelSize - inputSize;
+
+          if (autoPad == AutoPadKind::kSameLower) {
+            pads[padBeginIndex] = (padNeeded + 1) / 2;
+          } else {
+            pads[padBeginIndex] = padNeeded / 2;
+          }
+          pads[padEndIndex] = padNeeded - pads[padBeginIndex];
+
+          return (inputSize + padNeeded - kernelSize) / stride + 1;
+        }
+
+      default:
+        ORT_THROW("Unsupported AutoPad value.");
+    }
+  } else {
+    return (inputSize + pads[padBeginIndex] + pads[padEndIndex] - dkernel) / stride + 1;
+  }
+}
+
+Status GroupedConvVectorizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
+  // Declare input and output variables with appropriate usage flags
+  const auto& input = shader.AddInput("x", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias | ShaderUsage::UseUniform | ShaderUsage::UseShapeAndStride);
+  const auto& weights = shader.AddInput("w", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias | ShaderUsage::UseUniform);
+  const auto& output = shader.AddOutput("output", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias | ShaderUsage::UseUniform | ShaderUsage::UseShapeAndStride);
+
+  shader.AddInput("b", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias);
+
+  const std::string process_bias = attributes_.has_bias ? "value += b[output_channel];" : "";
+  const std::string_view base_type = output.StorageType();
+  const std::string apply_activation = GetActivationSnippet(attributes_.convAttributes, std::string(output.ValueType()), std::string(base_type));
+
+  // Build shader code
+  std::stringstream code;
+
+  // Add guard against out-of-bounds workgroup sizes
+  code << shader.GuardAgainstOutOfBoundsWorkgroupSizes("uniforms.output_size") << "\n";
+
+  // Calculate indices and positions
+  code << "let width0 = uniforms.output_shape[3];\n"
+       << "let output_channel = global_idx % width0;\n"
+       << "var index1 = global_idx / width0;\n"
+       << "let width1 = uniforms.output_shape[2] / " << attributes_.output_number << "u;\n"
+       << "let col = (index1 % width1) * " << attributes_.output_number << "u;\n"
+       << "index1 = index1 / width1;\n"
+       << "let row = index1 % uniforms.output_shape[1];\n"
+       << "let batch = index1 / uniforms.output_shape[1];\n\n";
+
+  // Calculate corner position
+  code << "let x_corner = vec2<i32>(i32(row), i32(col)) * uniforms.strides - uniforms.pads;\n\n";
+
+  // Declare arrays for intermediate values
+  code << "var x_vals: array<" << "x_value_t" << ", " << attributes_.x_number << ">;\n"
+       << "var values: array<" << "output_value_t" << ", " << attributes_.output_number << ">;\n"
+       << "let input_channel = output_channel;\n\n";
+
+  // Main computation loop
+  code << "for (var w_height: u32 = 0u; w_height < " << attributes_.w_shape[0] << "u; w_height++) {\n"
+       << "  let x_height = x_corner.x + i32(w_height);\n"
+       << "  if (x_height >= 0 && u32(x_height) < uniforms.x_shape[1]) {\n"
+       << "    for (var i = 0; i < " << attributes_.x_number << "; i++) {\n"
+       << "      let x_width = x_corner.y + i;\n"
+       << "      if (x_width >= 0 && u32(x_width) < uniforms.x_shape[2]) {\n"
+       << "        x_vals[i] = " << input.GetByIndices("x_indices_t(batch, u32(x_height), u32(x_width), input_channel)") << ";\n"
+       << "      } else {\n"
+       << "        x_vals[i] = " << "x_value_t" << "(0);\n"
+       << "      }\n"
+       << "    }\n"
+       << "    for (var w_width: u32 = 0u; w_width < " << attributes_.w_shape[1] << "u; w_width++) {\n"
+       << "      let w_val = " << weights.GetByIndices("w_indices_t(w_height, w_width, 0, output_channel)") << ";\n"
+       << "      for (var i = 0u; i < " << attributes_.output_number << "u; i++) {\n"
+       << "        values[i] = fma(x_vals[i * u32(uniforms.strides[1]) + w_width], w_val, values[i]);\n"
+       << "      }\n"
+       << "    }\n"
+       << "  }\n"
+       << "}\n\n";
+
+  // Write output values
+  code << "for (var i = 0u; i < " << attributes_.output_number << "u; i++) {\n"
+       << "  var value = values[i];\n"
+       << "  " << process_bias << "\n"
+       << "  " << apply_activation << "\n"
+       << "  " << output.SetByIndices("output_indices_t(batch, row, col + i, output_channel)", "value") << ";\n"
+       << "}\n";
+
+  shader.MainFunctionBody() << code.str();
+  return Status::OK();
+}
+
+Status GroupedConvProgram::GenerateShaderCode(ShaderHelper& shader) const {
+  // Declare input and output variables
+  const auto& x = shader.AddInput("x", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias | ShaderUsage::UseUniform | ShaderUsage::UseShapeAndStride);
+  const auto& w = shader.AddInput("w", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias | ShaderUsage::UseUniform | ShaderUsage::UseShapeAndStride);
+  const auto& output = shader.AddOutput("output", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias | ShaderUsage::UseUniform);
+
+  if (attributes_.has_bias) {
+    shader.AddInput("b", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias);
+  }
+
+  const std::string process_bias = attributes_.has_bias ? "value += b[output_channel];" : "";
+  const std::string_view base_type = output.StorageType();
+  const std::string apply_activation = GetActivationSnippet(attributes_.convAttributes, std::string(output.ValueType()), std::string(base_type));
+
+  // Build the main calculation logic based on layout
+  std::string calculate_result;
+  if (attributes_.is_channel_last) {
+    calculate_result = R"(
+      for (var wHeight: u32 = 0u; wHeight < uniforms.w_shape[0]; wHeight++) {
+        let xHeight = xRCCorner.x + wHeight * uniforms.dilations[0];
+
+        if (xHeight < 0u || xHeight >= uniforms.x_shape[1]) {
+          continue;
+        }
+
+        for (var wWidth: u32 = 0u; wWidth < uniforms.w_shape[1]; wWidth++) {
+          let xWidth = xRCCorner.y + wWidth * uniforms.dilations[1];
+          if (xWidth < 0u || xWidth >= uniforms.x_shape[2]) {
+            continue;
+          }
+
+          for (var wInChannel: u32 = 0u; wInChannel < uniforms.w_shape[2]; wInChannel++) {
+            let input_channel = in_channel_offset + wInChannel;
+            let xVal = )" +
+                       x.GetByIndices("x_indices_t(batch, xHeight, xWidth, input_channel)") + R"(;
+            let wVal = )" +
+                       w.GetByIndices("w_indices_t(wHeight, wWidth, wInChannel, output_channel)") + R"(;
+            value += xVal * wVal;
+          }
+        }
+      }
+    )";
+  } else {
+    calculate_result = R"(
+      for (var wInChannel: u32 = 0u; wInChannel < uniforms.w_shape[1]; wInChannel++) {
+        let input_channel = in_channel_offset + wInChannel;
+        for (var wHeight: u32 = 0u; wHeight < uniforms.w_shape[2]; wHeight++) {
+          let xHeight = xRCCorner.x + wHeight * uniforms.dilations[0];
+
+          if (xHeight < 0u || xHeight >= uniforms.x_shape[2]) {
+            continue;
+          }
+
+          for (var wWidth: u32 = 0u; wWidth < uniforms.w_shape[3]; wWidth++) {
+            let xWidth = xRCCorner.y + wWidth * uniforms.dilations[1];
+            if (xWidth < 0u || xWidth >= uniforms.x_shape[3]) {
+              continue;
+            }
+
+            let xVal = )" +
+                       x.GetByIndices("x_indices_t(batch, input_channel, xHeight, xWidth)") + R"(;
+            let wVal = )" +
+                       w.GetByIndices("w_indices_t(output_channel, wInChannel, wHeight, wWidth)") + R"(;
+            value += xVal * wVal;
+          }
+        }
+      }
+    )";
+  }
+
+  // Build the complete shader code
+  std::stringstream code;
+  code << shader.GuardAgainstOutOfBoundsWorkgroupSizes("uniforms.output_size") << "\n\n"
+       << "let outputIndices = " << output.OffsetToIndices("global_idx") << ";\n"
+       << "let batch: u32 = outputIndices[0];\n"
+       << "let output_channel: u32 = outputIndices[" << (attributes_.is_channel_last ? "3" : "1") << "];\n"
+       << "let xRCCorner: vec2<u32> = vec2<u32>(outputIndices[" << (attributes_.is_channel_last ? "1" : "2")
+       << "], outputIndices[" << (attributes_.is_channel_last ? "2" : "3") << "]) * uniforms.strides - uniforms.pads;\n"
+       << "let group_id: u32 = output_channel * " << attributes_.components << "u / uniforms.output_channels_per_group;\n"
+       << "var in_channel_offset = group_id * uniforms.w_shape[" << (attributes_.is_channel_last ? "2" : "1") << "];\n\n"
+       << "var value: " << "output_value_t" << " = " << "output_value_t" << "(0);\n"
+       << calculate_result << "\n"
+       << process_bias << "\n"
+       << apply_activation << "\n"
+       << output.SetByOffset("global_idx", "value") << ";\n";
+
+  shader.MainFunctionBody() << code.str();
+  return Status::OK();
+}
+
+Status NaiveMatmulProgram::GenerateShaderCode(ShaderHelper& shader) const {
+  // Setup input/output variables
+  const auto& a = shader.AddInput("a", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias);
+  const auto& b = shader.AddInput("b", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias);
+  const auto& output = shader.AddOutput("output", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias);
+
+  if (attributes_.has_bias) {
+    shader.AddInput("bias", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias);
+  }
+  const auto& batch_dims = shader.AddInput("batchDims", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias | ShaderUsage::UseOffsetToIndices);
+
+  const std::string_view base_type = "output_value_t";
+  const std::string apply_activation = GetActivationSnippet(attributes_.activationAttributes, "output_value_t", std::string(base_type));
+
+  // Generate bias processing code
+  std::string process_bias;
+  if (attributes_.has_bias) {
+    const uint32_t biasComponents = attributes_.isChannelsLast ? attributes_.components : 1;
+    process_bias = attributes_.isChannelsLast
+                       ? absl::StrCat("value += bias[col / ", biasComponents, "];")
+                       : absl::StrCat("value += ", "output_value_t", "(bias[row + i]);");
+  }
+
+  // Helper function to generate calculation result
+  auto generate_calc_result = [&]() {
+    std::stringstream cal_str;
+    cal_str << "var a_data: " << "a_value_t" << ";\n";
+
+    // Generate b_data loads
+    for (uint32_t i = 0; i < attributes_.a_components; i++) {
+      cal_str << "let b_data" << i << " = b[(b_offset + (k + " << i << ") * uniforms.N + col) / "
+              << attributes_.components << "];\n";
+    }
+
+    // Generate calculation for each output
+    for (uint32_t i = 0; i < attributes_.output_number; i++) {
+      cal_str << "a_data = a[(a_offset + (row + " << i << ") * uniforms.K + k) / "
+              << attributes_.a_components << "];\n";
+
+      for (uint32_t j = 0; j < attributes_.a_components; j++) {
+        cal_str << "values[" << i << "] = fma("
+                << "b_value_t" << "(a_data" << (attributes_.a_components == 1 ? "" : "[" + std::to_string(j) + "]")
+                << "), b_data" << j << ", values[" << i << "]);\n";
+      }
+    }
+    return cal_str.str();
+  };
+
+  // Build the main shader code
+  std::stringstream code;
+  code << shader.GuardAgainstOutOfBoundsWorkgroupSizes("uniforms.output_size") << "\n\n"
+       << "let col = (global_idx % (uniforms.N / " << attributes_.components << ")) * " << attributes_.components << ";\n"
+       << "var index1 = global_idx / (uniforms.N / " << attributes_.components << ");\n"
+       << "let stride1 = uniforms.M / " << attributes_.output_number << ";\n"
+       << "let row = (index1 % stride1) * " << attributes_.output_number << ";\n"
+       << "let batch = index1 / stride1;\n\n";
+
+  // Add batch indices calculation if needed
+  if (attributes_.outputShapeSize != 2) {
+    code << "let batch_indices = " << batch_dims.OffsetToIndices("batch") << ";\n";
+  }
+
+  // Setup indices and offsets
+  code << "var a_indices: " << "a_indices_t" << ";\n"
+       << ConvertOutputBatchIndicesToInputBatchIndices("a_indices", a, a.Rank() - 2, batch_dims.Rank(), "batch_indices") << "\n"
+       << a.IndicesSet("a_indices", a.Rank() - 2, "0") << "\n"
+       << a.IndicesSet("a_indices", a.Rank() - 1, "0") << "\n"
+       << "let a_offset = " << a.IndicesToOffset("a_indices") << ";\n\n"
+       << "var b_indices: " << "b_indices_t" << ";\n"
+       << ConvertOutputBatchIndicesToInputBatchIndices("b_indices", b, b.Rank() - 2, batch_dims.Rank(), "batch_indices") << "\n"
+       << b.IndicesSet("b_indices", b.Rank() - 2, "0") << "\n"
+       << b.IndicesSet("b_indices", b.Rank() - 1, "0") << "\n"
+       << "let b_offset = " << b.IndicesToOffset("b_indices") << ";\n\n"
+       << "var values: array<" << "output_value_t" << ", " << attributes_.output_number << ">;\n\n"
+       << "for (var k: u32 = 0u; k < uniforms.K; k = k + " << attributes_.a_components << ") {\n"
+       << generate_calc_result()
+       << "}\n\n"
+       << "for (var i = 0u; i < " << attributes_.output_number << "u; i++) {\n"
+       << "  var value = values[i];\n"
+       << "  " << process_bias << "\n"
+       << "  " << apply_activation << "\n"
+       << "  let cur_indices = " << "output_indices_t" << "(batch, row + i, col);\n"
+       << "  let offset = " << output.IndicesToOffset("cur_indices") << ";\n"
+       << "  " << output.SetByOffset("offset / " + std::to_string(attributes_.components), "value") << ";\n"
+       << "}\n";
+
+  shader.MainFunctionBody() << code.str();
+  return Status::OK();
 }
 
 }  // namespace webgpu

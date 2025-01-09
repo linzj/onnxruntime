@@ -325,5 +325,21 @@ std::string_view ShaderVariableHelper::ElementType() const {
 std::string_view ShaderIndicesHelper::IndicesType() const {
   return (usage_ & ShaderUsage::UseIndicesTypeAlias) ? indices_type_alias_ : indices_type_;
 }
+
+std::string ShaderIndicesHelper::Shape() const {
+  if (usage_ & ShaderUsage::UseShapeAndStride || usage_ & ShaderUsage::UseUniform) {
+    const std::string shape = (usage_ & ShaderUsage::UseUniform) ? "uniforms." + name_ + "_shape" : name_ + "_shape";
+    return shape;
+  }
+  return "";
+}
+
+std::string ShaderIndicesHelper::Stride() const {
+  if (usage_ & ShaderUsage::UseShapeAndStride || usage_ & ShaderUsage::UseUniform) {
+    const std::string stride = (usage_ & ShaderUsage::UseUniform) ? "uniforms." + name_ + "_stride" : name_ + "_stride";
+    return stride;
+  }
+  return "";
+}
 }  // namespace webgpu
 }  // namespace onnxruntime

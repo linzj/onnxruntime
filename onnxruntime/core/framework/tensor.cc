@@ -236,20 +236,6 @@ Tensor& Tensor::operator=(Tensor&& other) noexcept {
   return *this;
 }
 
-Tensor Tensor::ReshapeToTensor(const TensorShape& new_shape) const {
-  Tensor other;
-  other.p_data_ = p_data_;
-  other.shape_ = new_shape;
-#ifdef ENABLE_STRIDED_TENSORS
-  other.strides_ = strides_;
-  other.is_contiguous_ = is_contiguous_;
-#endif
-  other.dtype_ = dtype_;
-  other.alloc_info_ = alloc_info_;
-  other.byte_offset_ = byte_offset_;
-  return other;
-}
-
 Tensor::~Tensor() {
   ReleaseBuffer();
 }

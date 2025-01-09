@@ -265,8 +265,6 @@ class Tensor final {
     shape_ = new_shape;
   }
 
-  Tensor ReshapeToTensor(const TensorShape& new_shape) const;
-
   /**
    * Get the byte offset with respect to the p_data
    * @warning this is a temporary solution for reusing the buffer bigger than needed.
