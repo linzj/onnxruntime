@@ -595,14 +595,101 @@ Status RunConv2DMatMulProgram(
     ComputeContext& context,
     const std::vector<const Tensor*>& inputs,
     const ConvAttributes& attributes,
-    const TensorShapeVector& outputShape,
-    int64_t dimAOuter,
-    int64_t dimBOuter,
-    int64_t dimInner,
-    bool hasBias,
-    bool sequentialAccessByThreads,
+    const TensorShapeVector& output_shape,
+    int64_t dim_a_outer,
+    int64_t dim_b_outer,
+    int64_t dim_inner,
+    bool has_bias,
+    bool sequential_access_by_threads,
     Tensor*& output_tensor) {
-  ORT_THROW("Conv2DMatMul is not implemented yet.");
+  // Calculate output shape and create output tensor
+  output_tensor = context.Output(0, TensorShape(output_shape));
+
+  // Create program
+  auto program = std::make_unique<Conv2DMatMulProgram>();
+
+  // Setup general attributes
+  const auto outer_dims = std::vector<uint32_t>(output_shape.begin(), output_shape.end() - 2);
+  const bool is_channels_last = !attributes.nchw;
+  const bool is_vec4 = dim_inner % 4 == 0 && dim_b_outer % 4 == 0;
+  const uint32_t components = is_vec4 ? 4 : 1;
+
+  // Set elements per thread based on input dimensions
+  std::array<uint32_t, 3> elements_per_thread = {
+      4,
+      dim_a_outer <= 8 ? 1u : 4u,
+      1};
+
+  // Set workgroup size
+  std::array<uint32_t, 3> workgroup_size = {8, 8, 1};
+
+  // Setup program attributes
+  program->attributes_.components = components;
+  program->attributes_.has_bias = has_bias;
+  program->attributes_.is_channels_last = is_channels_last;
+  program->attributes_.activationAttributes = attributes;
+  program->attributes_.outer_dims = outer_dims;
+  program->attributes_.elements_per_thread = elements_per_thread;
+  program->attributes_.workgroup_size = workgroup_size;
+
+  // Get input channels dimension based on layout
+  const uint32_t input_channels = static_cast<uint32_t>(
+      is_channels_last ? inputs[0]->Shape()[3] : inputs[0]->Shape()[1]);
+
+  // Setup program attributes
+  program->attributes_.components = components;
+  program->attributes_.has_bias = has_bias;
+  program->attributes_.is_channels_last = is_channels_last;
+  program->attributes_.activationAttributes = attributes;
+  program->attributes_.outer_dims = outer_dims;
+  program->attributes_.elements_per_thread = elements_per_thread;
+  program->attributes_.workgroup_size = workgroup_size;
+  program->attributes_.channels = input_channels;                         // Set channels
+  program->attributes_.dim_a_outer = static_cast<uint32_t>(dim_a_outer);  // Set dim_a_outer
+  program->attributes_.dim_b_outer = static_cast<uint32_t>(dim_b_outer);  // Set dim_a_outer
+  program->attributes_.dim_inner = static_cast<uint32_t>(dim_inner);      // Set dim_inner
+
+  // Configure inputs/outputs
+  program->AddInputs({{inputs[0], ProgramTensorMetadataDependency::TypeAndShape}});
+  program->AddInputs({{inputs[1], ProgramTensorMetadataDependency::TypeAndShape}});
+  if (has_bias) {
+    program->AddInputs({{inputs[2], ProgramTensorMetadataDependency::None}});
+  }
+  program->AddOutput({output_tensor, ProgramTensorMetadataDependency::None});
+
+  // Calculate dispatch size
+  const std::array<uint32_t, 3> dispatch_size = {
+      static_cast<uint32_t>(ceil(static_cast<float>(dim_b_outer) /
+                                 (workgroup_size[0] * elements_per_thread[0]))),
+      static_cast<uint32_t>(ceil(static_cast<float>(dim_a_outer) /
+                                 (workgroup_size[1] * elements_per_thread[1]))),
+      static_cast<uint32_t>(ceil(static_cast<float>(TensorShape(output_shape).Size()) /
+                                 (workgroup_size[2] * elements_per_thread[2])))};
+
+  // Set dispatch parameters
+  program->SetDispatchGroupSize(dispatch_size[0], dispatch_size[1], dispatch_size[2]);
+  program->SetWorkgroupSize(workgroup_size[0], workgroup_size[1], workgroup_size[2]);
+
+  // Add uniform variables
+  program->AddUniformVariables({{static_cast<int32_t>(dim_a_outer)},
+                                {static_cast<int32_t>(dim_b_outer)},
+                                {static_cast<int32_t>(dim_inner)},
+                                {attributes.clipMax.has_value() ? attributes.clipMax.value() : 3.4028234663852886e38f},
+                                {attributes.clipMin.has_value() ? attributes.clipMin.value() : -3.4028234663852886e38f},
+                                {attributes.alpha.has_value() ? attributes.alpha.value() : 0.2f},
+                                {attributes.beta.has_value() ? attributes.beta.value() : 0.5f}});
+
+  // Cache hint for program
+  program->CacheHint(absl::StrJoin(
+      {std::to_string(elements_per_thread[0]),
+       std::to_string(elements_per_thread[1]),
+       std::to_string(elements_per_thread[2]),
+       std::to_string(is_vec4),
+       std::to_string(is_channels_last)},
+      ";"));
+
+  // Run the program
+  return context.RunProgram(*program);
 }
 
 std::string GetActivationSnippet(
@@ -637,6 +724,247 @@ std::string GetActivationSnippet(
     default:
       ORT_THROW("Unsupported activation");
   }
+}
+
+// Helper functions moved from MatmulProgram class to anonymous namespace
+std::string WriteDataToSubAVec4SnippetImpl(bool transposeA, const ShaderIndicesHelper& batchDims) {
+  std::stringstream code;
+  if (transposeA) {
+    code << "mm_Asub[inputRow][inputCol] = mm_readA(batch, kStart + inputRow, "
+         << "globalRowStart / innerElementSize + inputCol" << (batchDims.Rank() > 0 ? ", batchIndices" : "") << ");";
+  } else {
+    code << "mm_Asub[inputRow][inputCol] = mm_readA(batch, globalRowStart + inputRow, "
+         << "kStart / innerElementSize + inputCol" << (batchDims.Rank() > 0 ? ", batchIndices" : "") << ");";
+  }
+  return code.str();
+}
+
+std::string WriteDataToSubASnippetImpl(bool transposeA, const ShaderIndicesHelper& batchDims) {
+  std::stringstream code;
+  if (transposeA) {
+    code << "mm_Asub[inputRow][inputCol] = mm_readA(batch, "
+         << "kStart + inputRow, "
+         << "globalRowStart + inputCol"
+         << (batchDims.Rank() > 0 ? ", batchIndices" : "")
+         << ");";
+  } else {
+    code << "mm_Asub[inputRow][inputCol] = mm_readA(batch, "
+         << "globalRowStart + inputRow, "
+         << "kStart + inputCol"
+         << (batchDims.Rank() > 0 ? ", batchIndices" : "")
+         << ");";
+  }
+  return code.str();
+}
+
+std::string GenerateReadBCodeImpl(const std::string& batch, const std::string& row,
+                                  const std::string& col, const ShaderIndicesHelper& batchDims) {
+  std::stringstream code;
+  code << "mm_readB(" << batch << ", " << row << ", " << col
+       << (batchDims.Rank() > 0 ? ", batchIndices" : "") << ")";
+  return code.str();
+}
+
+std::string GenerateComputationLoopImpl(bool transposeA, uint32_t inner_element_size) {
+  std::stringstream code;
+  code << "    for (var k = 0; k < tileInner; k = k + 1) {\n"
+       << "        let BCached0 = mm_Bsub[k][globalCol / 4];\n\n"
+       << "        let BCached1 = mm_Bsub[k * innerElementSize + 1][tileCol];\n\n"
+       << "        let BCached2 = mm_Bsub[k * innerElementSize + 2][tileCol];";
+  if (inner_element_size == 3) {
+    code << "        let BCached3 = mm_Bsub[k * innerElementSize + 3][tileCol];\n";
+  }
+
+  if (transposeA) {
+    code << "        let ACached0 = mm_Asub[k * innerElementSize][localRow];\n"
+         << "        let ACached1 = mm_Asub[k * innerElementSize + 1][localRow];\n"
+         << "        let ACached2 = mm_Asub[k * innerElementSize + 2][localRow];\n";
+    if (inner_element_size == 3) {
+      code << "        let ACached3 = mm_Asub[k * innerElementSize + 3][localRow];\n";
+    }
+
+    code << "        for (var i = 0; i < rowPerThread; i = i + 1) {\n"
+         << "          acc[i] = fma(BCached0, ACached0[i], acc[i]);\n"
+         << "          acc[i] = fma(BCached0, ACached1[i], acc[i]);\n"
+         << "          acc[i] = fma(BCached0, ACached2[i], acc[i]);\n";
+    if (inner_element_size == 3) {
+      code << "          acc[i] = fma(BCached0, ACached3[i], acc[i]);\n";
+    }
+    code << "        }\n";
+  } else {
+    code << "        for (var i = 0; i < rowPerThread; i = i + 1) {\n"
+         << "          let ACached = mm_Asub[tileRow + i][k];\n"
+         << "          acc[i] = fma(BCached0, ACached.x, acc[i]);\n"
+         << "          acc[i] = fma(BCached0, ACached.y, acc[i]);\n"
+         << "          acc[i] = fma(BCached0, ACached.z, acc[i]);\n";
+    if (inner_element_size == 3) {
+      code << "          acc[i] = fma(BCached0, ACached.w, acc[i]);\n";
+    }
+    code << "        }\n";
+  }
+
+  code << "    }\n";
+  return code.str();
+}
+
+std::string GenerateOutputCodeImpl() {
+  return "for (var innerRow = 0; innerRow < rowPerThread; innerRow = innerRow + 1) {\n"
+         "    mm_write(batch, globalRow + innerRow, globalCol, acc[innerRow]);\n"
+         "}\n";
+}
+
+void GenerateMatMulPackedVec4Code(OStringStream& additional_implementation,
+                                  OStringStream& main_function_body,
+                                  const ShaderIndicesHelper& batch_dims,
+                                  const std::array<uint32_t, 3>& workgroup_size,
+                                  const std::array<uint32_t, 3>& elements_per_thread,
+                                  uint32_t inner_element_size) {
+  const uint32_t tile_a_outer = workgroup_size[1] * elements_per_thread[1];
+  const uint32_t tile_b_outer = workgroup_size[0] * elements_per_thread[0];
+  const uint32_t tile_a_width = tile_a_outer;
+  const uint32_t tile_a_height = inner_element_size;
+  const uint32_t row_per_thread_b = inner_element_size / workgroup_size[1];
+
+  // Generate workgroup shared memory declarations
+  additional_implementation
+      << "var<workgroup> mm_Asub: array<array<vec" << inner_element_size
+      << "<input_value_t>, " << tile_a_width / inner_element_size << ">, " << tile_a_height << ">;\n"
+      << "var<workgroup> mm_Bsub: array<array<vec4<f32>, "
+      << tile_b_outer / elements_per_thread[0] << ">, " << 32 << ">;\n\n"
+      << "const rowPerThread = " << elements_per_thread[1] << ";\n"
+      << "const colPerThread = " << elements_per_thread[0] << ";\n"
+      << "const innerElementSize = " << inner_element_size << ";\n"
+      << "const tileInner = " << 32 << ";\n\n";
+
+  // Generate main computation
+  main_function_body
+      << "let localRow = i32(localId.y);\n"
+      << "let tileRow = localRow * rowPerThread;\n"
+      << "let tileCol = i32(localId.x);\n\n"
+      << "let globalRow = i32(globalId.y) * rowPerThread;\n"
+      << "let globalCol = i32(globalId.x);\n"
+      << "let batch = i32(globalId.z);\n";
+
+  if (batch_dims.Rank() > 0) {
+    main_function_body << "let batchIndices = " << batch_dims.OffsetToIndices("u32(batch)") << ";\n";
+  }
+
+  main_function_body
+      << "let globalRowStart = i32(workgroupId.y) * " << tile_a_outer << ";\n\n"
+      << "let num_tiles = (uniforms.dim_inner - 1) / tileInner + 1;\n"
+      << "var kStart = 0;\n\n"
+      << "var acc: array<vec4<input_value_t>, rowPerThreadB>;\n\n"
+      << "let tileRowB = localRow * " << row_per_thread_b << ";\n";
+
+  // Generate tile loading and computation loops
+  main_function_body
+      << "for (var t = 0; t < num_tiles; t = t + 1) {\n"
+      << "    for (var innerRow = 0; innerRow < rowPerThread; innerRow = innerRow + 1) {\n"
+      << "        let inputRow = tileRow + innerRow;\n"
+      << "        let inputCol = tileCol;\n"
+      << WriteDataToSubAVec4SnippetImpl(false, batch_dims) << "\n"
+      << "    }\n\n"
+      << "    for (var innerRow = 0; innerRow < " << row_per_thread_b << "; innerRow = innerRow + 1) {\n"
+      << "        let inputRow = tileRowB + innerRow;\n"
+      << "        let inputCol = tileCol;\n"
+      << "        mm_Bsub[inputRow][inputCol] = "
+      << GenerateReadBCodeImpl("batch", "kStart + inputRow", "globalCol", batch_dims) << ";\n"
+      << "    }\n"
+      << "    kStart = kStart + tileInner;\n"
+      << "    workgroupBarrier();\n\n"
+      << GenerateComputationLoopImpl(false, inner_element_size)
+      << "    workgroupBarrier();\n"
+      << "}\n\n"
+      << GenerateOutputCodeImpl();
+}
+
+void GenerateMatMulPackedCode(OStringStream& additional_implementation,
+                              OStringStream& main_function_body,
+                              const ShaderIndicesHelper& batch_dims,
+                              const std::array<uint32_t, 3>& workgroup_size,
+                              const std::array<uint32_t, 3>& elements_per_thread,
+                              uint32_t tile_inner, const bool kTransposeA) {
+  const uint32_t tile_a_outer = workgroup_size[1] * elements_per_thread[1];
+  const uint32_t tile_b_outer = workgroup_size[0] * elements_per_thread[0];
+  const uint32_t tile_a_width = kTransposeA ? tile_a_outer : tile_inner;
+  const uint32_t tile_a_height = kTransposeA ? tile_inner : tile_a_outer;
+  const uint32_t row_per_thread_a = tile_a_height / workgroup_size[1];
+  const uint32_t col_per_thread_a = tile_a_width / workgroup_size[0];
+  const uint32_t row_per_thread_b = tile_inner / workgroup_size[1];
+
+  // Generate workgroup shared memory declarations
+  additional_implementation
+      << "var<workgroup> mm_Asub: array<array<" << "input_value_t" << ", " << tile_a_width << ">, " << tile_a_height << ">;\n"
+      << "var<workgroup> mm_Bsub: array<array<" << "input_value_t" << ", " << tile_b_outer << ">, " << tile_inner << ">;\n"
+      << "const rowPerThread = " << elements_per_thread[1] << ";\n"
+      << "const colPerThread = " << elements_per_thread[0] << ";\n"
+      << "const tileInner = " << tile_inner << ";\n\n";
+
+  // Generate main computation
+  main_function_body
+      << "let tileRow = i32(localId.y) * rowPerThread;\n"
+      << "let tileCol = i32(localId.x) * colPerThread;\n\n"
+      << "let globalRow = i32(globalId.y) * rowPerThread;\n"
+      << "let globalCol = i32(globalId.x) * colPerThread;\n"
+      << "let globalRowStart = i32(workgroupId.y) * " << tile_a_outer << ";\n\n"
+      << "let tileRowA = i32(localId.y) * " << row_per_thread_a << ";\n"
+      << "let tileColA = i32(localId.x) * " << col_per_thread_a << ";\n"
+      << "let tileRowB = i32(localId.y) * " << row_per_thread_b << ";\n\n"
+      << "let batch = i32(globalId.z);\n";
+
+  if (batch_dims.Rank() > 0) {
+    main_function_body << "let batchIndices = " << batch_dims.OffsetToIndices("u32(batch)") << ";\n";
+  }
+
+  main_function_body
+      << "let num_tiles = (uniforms.dim_inner - 1) / tileInner + 1;\n"
+      << "var kStart = 0;\n\n"
+      << "var acc: array<array<" << "input_value_t" << ", " << elements_per_thread[0] << ">, "
+      << elements_per_thread[1] << ">;\n\n";
+
+  // Generate standard matmul loop
+  main_function_body
+      << "for (var t = 0; t < num_tiles; t = t + 1) {\n"
+      // Load tile of A
+      << "  for (var innerRow = 0; innerRow < " << row_per_thread_a << "; innerRow = innerRow + 1) {\n"
+      << "    for (var innerCol = 0; innerCol < " << col_per_thread_a << "; innerCol = innerCol + 1) {\n"
+      << "      let inputRow = tileRowA + innerRow;\n"
+      << "      let inputCol = tileColA + innerCol;\n"
+      << "      " << WriteDataToSubASnippetImpl(kTransposeA, batch_dims) << "\n"
+      << "    }\n"
+      << "  }\n\n"
+      // Load tile of B
+      << "  for (var innerRow = 0; innerRow < " << row_per_thread_b << "; innerRow = innerRow + 1) {\n"
+      << "    for (var innerCol = 0; innerCol < colPerThread; innerCol = innerCol + 1) {\n"
+      << "      let inputRow = tileRowB + innerRow;\n"
+      << "      let inputCol = tileCol + innerCol;\n"
+      << "      mm_Bsub[inputRow][inputCol] = " << GenerateReadBCodeImpl("batch", "kStart + inputRow", "globalCol + innerCol", batch_dims) << ";\n"
+      << "    }\n"
+      << "  }\n"
+      << "  kStart = kStart + tileInner;\n"
+      << "  workgroupBarrier();\n\n"
+      // Compute accumulation
+      << "  var BCached: array<" << "input_value_t" << ", " << elements_per_thread[0] << ">;\n"
+      << "  for (var k = 0; k < tileInner; k = k + 1) {\n"
+      << "    for (var inner = 0; inner < colPerThread; inner = inner + 1) {\n"
+      << "      BCached[inner] = mm_Bsub[k][tileCol + inner];\n"
+      << "    }\n\n"
+      << "    for (var innerRow = 0; innerRow < rowPerThread; innerRow = innerRow + 1) {\n"
+      << "      let ACached = mm_Asub[" << (kTransposeA ? "k" : "tileRow + innerRow") << "]["
+      << (kTransposeA ? "tileRow + innerRow" : "k") << "];\n"
+      << "      for (var innerCol = 0; innerCol < colPerThread; innerCol = innerCol + 1) {\n"
+      << "        acc[innerRow][innerCol] = acc[innerRow][innerCol] + ACached * BCached[innerCol];\n"
+      << "      }\n"
+      << "    }\n"
+      << "  }\n\n"
+      << "  workgroupBarrier();\n"
+      << "}\n\n"
+      // Write output
+      << "for (var innerRow = 0; innerRow < rowPerThread; innerRow = innerRow + 1) {\n"
+      << "  for (var innerCol = 0; innerCol < colPerThread; innerCol = innerCol + 1) {\n"
+      << "    mm_write(batch, globalRow + innerRow, globalCol + innerCol, acc[innerRow][innerCol]);\n"
+      << "  }\n"
+      << "}\n";
 }
 
 }  // namespace
@@ -952,6 +1280,7 @@ Status Conv::HandleConv2D(ComputeContext& context, const ConvAttributes& attribu
   const bool is1x1Conv = weight_height == 1 && weight_width == 1 &&
                          attributes.dilations[0] == 1 && attributes.dilations[1] == 1 &&
                          attributes.strides[0] == 1 && attributes.strides[1] == 1 &&
+                         attributes.pads[0] == 0 && attributes.pads[1] == 0 &&
                          attributes.pads[0] == 0 && attributes.pads[1] == 0;
 
   if (same_size || is1x1Conv) {
@@ -1420,259 +1749,31 @@ Status MatmulProgram::GenerateShaderCode(ShaderHelper& shader) const {
                                                             ShaderUsage::UseOffsetToIndices);
 
   std::vector<const ShaderVariableHelper*> inputs = {&batch_dims, &a, &b, &output};
-  const bool isVec4 = attributes_.components == 4;
+  const bool is_vec4 = attributes_.components == 4;
   std::string workgroup_decl;
   std::string main_code;
   constexpr const bool kTransposeA = false;
-  constexpr const bool kSplitK = false;
-  constexpr const uint32_t kSplitedDimInner = 32;
   constexpr const uint32_t kTileInner = 32;
   shader.AdditionalImplementation() << GenerateMatMulReadWriteFnSource(inputs);
-  if (isVec4) {
+  if (is_vec4) {
     // For vec4 implementation
-    const uint32_t tile_a_outer = attributes_.workgroup_size[1] * attributes_.elements_per_thread[1];
-    const uint32_t tile_b_outer = attributes_.workgroup_size[0] * attributes_.elements_per_thread[0];
-    const uint32_t tile_a_width = kTransposeA ? tile_a_outer : kTileInner;
-    const uint32_t tile_a_height = kTransposeA ? kTileInner : tile_a_outer;
-    const uint32_t inner_element_size = tile_a_width / attributes_.workgroup_size[0];
-    const uint32_t row_per_thread_b = kTileInner / attributes_.workgroup_size[1];
-
-    // Generate workgroup shared memory declarations
-    shader.AdditionalImplementation()
-        << "var<workgroup> mm_Asub: array<array<vec" << inner_element_size
-        << "<" << "input_value_t" << ">, " << tile_a_width / inner_element_size << ">, " << tile_a_height << ">;\n"
-        << "var<workgroup> mm_Bsub: array<array<vec4<f32>, "
-        << tile_b_outer / attributes_.elements_per_thread[0] << ">, " << 32 << ">;\n\n"
-        << "const rowPerThread = " << attributes_.elements_per_thread[1] << ";\n"
-        << "const colPerThread = " << attributes_.elements_per_thread[0] << ";\n"
-        << "const innerElementSize = " << inner_element_size << ";\n"
-        << "const tileInner = " << 32 << ";\n\n";
-
-    // Generate main computation
-    OStringStream& code = shader.MainFunctionBody();
-    code << "let localRow = i32(localId.y);\n"
-         << "let tileRow = localRow * rowPerThread;\n"
-         << "let tileCol = i32(localId.x);\n\n"
-         << "let globalRow = i32(globalId.y) * rowPerThread;\n"
-         << "let globalCol = i32(globalId.x);\n";
-    if (kSplitK) {
-      code << "let batch = 0;\n";
-    } else {
-      code << "let batch = i32(globalId.z);\n";
-    }
-
-    if (batch_dims.Rank() > 0) {
-      code << "let batchIndices = " << batch_dims.OffsetToIndices("u32(batch)") << ";\n";
-    }
-
-    code << "let globalRowStart = i32(workgroupId.y) * " << tile_a_outer << ";\n\n";
-
-    if (kSplitK) {
-      code << "let num_tiles = " << (kSplitedDimInner + kTileInner - 1) / kTileInner << ";\n"
-           << "var kStart = i32(globalId.z) * " << kSplitedDimInner << ";\n\n";
-    } else {
-      code << "let num_tiles = (uniforms.dim_inner - 1) / tileInner + 1;\n"
-           << "var kStart = 0;\n\n";
-    }
-    code << "var acc: array<vec4<" << "input_value_t" << ">, " << "rowPerThreadB" << ">;\n\n"
-         << "let tileRowB = localRow * " << row_per_thread_b << ";\n";
-
-    // Generate tile loading and computation loops
-    code << "for (var t = 0; t < num_tiles; t = t + 1) {\n"
-         << "    for (var innerRow = 0; innerRow < rowPerThread; innerRow = innerRow + 1) {\n"
-         << "        let inputRow = tileRow + innerRow;\n"
-         << "        let inputCol = tileCol;\n"
-         << WriteDataToSubAVec4Snippet(kTransposeA, batch_dims) << "\n"
-         << "    }\n\n"
-         << "    for (var innerRow = 0; innerRow < " << row_per_thread_b << "; innerRow = innerRow + 1) {\n"
-         << "        let inputRow = tileRowB + innerRow;\n"
-         << "        let inputCol = tileCol;\n"
-         << "        mm_Bsub[inputRow][inputCol] = "
-         << GenerateReadBCode("batch", "kStart + inputRow", "globalCol", batch_dims) << ";\n"
-         << "    }\n"
-         << "    kStart = kStart + tileInner;\n"
-         << "    workgroupBarrier();\n\n"
-         << GenerateComputationLoop(kTransposeA, inner_element_size)
-         << "    workgroupBarrier();\n"
-         << "}\n\n"
-         << GenerateOutputCode();
-
+    GenerateMatMulPackedVec4Code(shader.AdditionalImplementation(),
+                                 shader.MainFunctionBody(),
+                                 batch_dims,
+                                 attributes_.workgroup_size,
+                                 attributes_.elements_per_thread,
+                                 kTileInner);
   } else {
     // For standard implementation
-    const uint32_t tile_a_outer = attributes_.elements_per_thread[1] * attributes_.workgroup_size[1];
-    const uint32_t tile_b_outer = attributes_.elements_per_thread[0] * attributes_.workgroup_size[0];
-    const uint32_t tile_a_width = kTransposeA ? tile_a_outer : kTileInner;
-    const uint32_t tile_a_height = kTransposeA ? kTileInner : tile_a_outer;
-    const uint32_t row_per_thread_a = tile_a_height / attributes_.workgroup_size[1];
-    const uint32_t col_per_thread_a = tile_a_width / attributes_.workgroup_size[0];
-    const uint32_t row_per_thread_b = kTileInner / attributes_.workgroup_size[1];
-
-    // Generate workgroup shared memory declarations
-    shader.AdditionalImplementation()
-        << "var<workgroup> mm_Asub: array<array<" << "input_value_t" << ", " << tile_a_width << ">, " << tile_a_height << ">;\n"
-        << "var<workgroup> mm_Bsub: array<array<" << "input_value_t" << ", " << tile_b_outer << ">, " << kTileInner << ">;\n"
-        << "const rowPerThread = " << attributes_.elements_per_thread[1] << ";\n"
-        << "const colPerThread = " << attributes_.elements_per_thread[0] << ";\n"
-        << "const tileInner = " << kTileInner << ";\n\n";
-
-    // Generate standard matmul implementation
-    OStringStream& code = shader.MainFunctionBody();
-    code << "let tileRow = i32(localId.y) * rowPerThread;\n"
-         << "let tileCol = i32(localId.x) * colPerThread;\n\n"
-         << "let globalRow = i32(globalId.y) * rowPerThread;\n"
-         << "let globalCol = i32(globalId.x) * colPerThread;\n"
-         << "let globalRowStart = i32(workgroupId.y) * " << tile_a_outer << ";\n\n"
-         << "let tileRowA = i32(localId.y) * " << row_per_thread_a << ";\n"
-         << "let tileColA = i32(localId.x) * " << col_per_thread_a << ";\n"
-         << "let tileRowB = i32(localId.y) * " << row_per_thread_b << ";\n\n"
-         << "let batch = i32(globalId.z);\n";
-
-    if (batch_dims.Rank() > 0) {
-      code << "let batchIndices = " << batch_dims.OffsetToIndices("u32(batch)") << ";\n";
-    }
-
-    code << "let num_tiles = (uniforms.dim_inner - 1) / tileInner + 1;\n"
-         << "var kStart = 0;\n\n"
-         << "var acc: array<array<" << "input_value_t" << ", " << attributes_.elements_per_thread[0] << ">, "
-         << attributes_.elements_per_thread[1] << ">;\n\n"
-         << GenerateStandardMatmulLoop(kTransposeA, row_per_thread_a, col_per_thread_a, row_per_thread_b, batch_dims);
+    GenerateMatMulPackedCode(shader.AdditionalImplementation(),
+                             shader.MainFunctionBody(),
+                             batch_dims,
+                             attributes_.workgroup_size,
+                             attributes_.elements_per_thread,
+                             kTileInner, kTransposeA);
   }
 
   return Status::OK();
-}
-
-std::string MatmulProgram::GenerateReadBCode(const std::string& batch, const std::string& row,
-                                             const std::string& col, const ShaderIndicesHelper& batchDims) const {
-  std::stringstream code;
-  code << "mm_readB(" << batch << ", " << row << ", " << col
-       << (batchDims.Rank() > 0 ? ", batchIndices" : "") << ")";
-  return code.str();
-}
-
-std::string MatmulProgram::GenerateComputationLoop(bool transposeA, uint32_t inner_element_size) const {
-  std::stringstream code;
-  code << "    for (var k = 0; k < tileInner; k = k + 1) {\n"
-       << "        let BCached0 = mm_Bsub[k][globalCol / 4];\n\n"
-       << "        let BCached1 = mm_Bsub[k * innerElementSize + 1][tileCol];\n\n"
-       << "        let BCached2 = mm_Bsub[k * innerElementSize + 2][tileCol];";
-  if (inner_element_size == 3) {
-    code << "        let BCached3 = mm_Bsub[k * innerElementSize + 3][tileCol];\n";
-  }
-
-  if (transposeA) {
-    code << "        let ACached0 = mm_Asub[k * innerElementSize][localRow];\n"
-         << "        let ACached1 = mm_Asub[k * innerElementSize + 1][localRow];\n"
-         << "        let ACached2 = mm_Asub[k * innerElementSize + 2][localRow];\n";
-    if (inner_element_size == 3) {
-      code << "        let ACached3 = mm_Asub[k * innerElementSize + 3][localRow];\n";
-    }
-
-    code << "        for (var i = 0; i < rowPerThread; i = i + 1) {\n"
-         << "          acc[i] = fma(BCached0, ACached0[i], acc[i]);\n"
-         << "          acc[i] = fma(BCached0, ACached1[i], acc[i]);\n"
-         << "          acc[i] = fma(BCached0, ACached2[i], acc[i]);\n";
-    if (inner_element_size == 3) {
-      code << "          acc[i] = fma(BCached0, ACached3[i], acc[i]);\n";
-    }
-    code << "        }\n";
-  } else {
-    code << "        for (var i = 0; i < rowPerThread; i = i + 1) {\n"
-         << "          let ACached = mm_Asub[tileRow + i][k];\n"
-         << "          acc[i] = fma(BCached0, ACached.x, acc[i]);\n"
-         << "          acc[i] = fma(BCached0, ACached.y, acc[i]);\n"
-         << "          acc[i] = fma(BCached0, ACached.z, acc[i]);\n";
-    if (inner_element_size == 3) {
-      code << "          acc[i] = fma(BCached0, ACached.w, acc[i]);\n";
-    }
-    code << "        }\n";
-  }
-
-  code << "    }\n";
-  return code.str();
-}
-
-std::string MatmulProgram::GenerateOutputCode() const {
-  return "for (var innerRow = 0; innerRow < rowPerThread; innerRow = innerRow + 1) {\n"
-         "    mm_write(batch, globalRow + innerRow, globalCol, acc[innerRow]);\n"
-         "}\n";
-}
-
-std::string MatmulProgram::GenerateStandardMatmulLoop(bool transpose_a, uint32_t row_per_thread_a,
-                                                      uint32_t col_per_thread_a, uint32_t row_per_thread_b, const ShaderIndicesHelper& batch_dims) const {
-  std::stringstream code;
-  code << "for (var t = 0; t < num_tiles; t = t + 1) {\n"
-       // Load tile of A
-       << "  for (var innerRow = 0; innerRow < " << row_per_thread_a << "; innerRow = innerRow + 1) {\n"
-       << "    for (var innerCol = 0; innerCol < " << col_per_thread_a << "; innerCol = innerCol + 1) {\n"
-       << "      let inputRow = tileRowA + innerRow;\n"
-       << "      let inputCol = tileColA + innerCol;\n"
-       << "      " << WriteDataToSubASnippet(transpose_a, batch_dims) << "\n"
-       << "    }\n"
-       << "  }\n\n"
-       // Load tile of B
-       << "  for (var innerRow = 0; innerRow < " << row_per_thread_b << "; innerRow = innerRow + 1) {\n"
-       << "    for (var innerCol = 0; innerCol < colPerThread; innerCol = innerCol + 1) {\n"
-       << "      let inputRow = tileRowB + innerRow;\n"
-       << "      let inputCol = tileCol + innerCol;\n"
-       << "      mm_Bsub[inputRow][inputCol] = " << GenerateReadBCode("batch", "kStart + inputRow", "globalCol + innerCol", batch_dims) << ";\n"
-       << "    }\n"
-       << "  }\n"
-       << "  kStart = kStart + tileInner;\n"
-       << "  workgroupBarrier();\n\n"
-       // Compute accumulation
-       << "  var BCached: array<" << "input_value_t" << ", colPerThread>;\n"
-       << "  for (var k = 0; k < tileInner; k = k + 1) {\n"
-       << "    for (var inner = 0; inner < colPerThread; inner = inner + 1) {\n"
-       << "      BCached[inner] = mm_Bsub[k][tileCol + inner];\n"
-       << "    }\n\n"
-       << "    for (var innerRow = 0; innerRow < rowPerThread; innerRow = innerRow + 1) {\n"
-       << "      let ACached = mm_Asub[" << (transpose_a ? "k" : "tileRow + innerRow") << "]["
-       << (transpose_a ? "tileRow + innerRow" : "k") << "];\n"
-       << "      for (var innerCol = 0; innerCol < colPerThread; innerCol = innerCol + 1) {\n"
-       << "        acc[innerRow][innerCol] = acc[innerRow][innerCol] + ACached * BCached[innerCol];\n"
-       << "      }\n"
-       << "    }\n"
-       << "  }\n\n"
-       << "  workgroupBarrier();\n"
-       << "}\n\n"
-       // Write output
-       << "for (var innerRow = 0; innerRow < rowPerThread; innerRow = innerRow + 1) {\n"
-       << "  for (var innerCol = 0; innerCol < colPerThread; innerCol = innerCol + 1) {\n"
-       << "    mm_write(batch, globalRow + innerRow, globalCol + innerCol, acc[innerRow][innerCol]);\n"
-       << "  }\n"
-       << "}\n";
-
-  return code.str();
-}
-
-std::string MatmulProgram::WriteDataToSubAVec4Snippet(bool transposeA, const ShaderIndicesHelper& batchDims) const {
-  std::stringstream code;
-  if (transposeA) {
-    code << "mm_Asub[inputRow][inputCol] = mm_readA(batch, kStart + inputRow, "
-         << "globalRowStart / innerElementSize + inputCol" << (batchDims.Rank() > 0 ? ", batchIndices" : "") << ");";
-  } else {
-    code << "mm_Asub[inputRow][inputCol] = mm_readA(batch, globalRowStart + inputRow, "
-         << "kStart / innerElementSize + inputCol" << (batchDims.Rank() > 0 ? ", batchIndices" : "") << ");";
-  }
-  return code.str();
-}
-
-std::string MatmulProgram::WriteDataToSubASnippet(bool transposeA, const ShaderIndicesHelper& batchDims) const {
-  std::stringstream code;
-  if (transposeA) {
-    code << "mm_Asub[inputRow][inputCol] = mm_readA(batch, "
-         << "kStart + inputRow, "
-         << "globalRowStart + inputCol"
-         << (batchDims.Rank() > 0 ? ", batchIndices" : "")
-         << ");";
-  } else {
-    code << "mm_Asub[inputRow][inputCol] = mm_readA(batch, "
-         << "globalRowStart + inputRow, "
-         << "kStart + inputCol"
-         << (batchDims.Rank() > 0 ? ", batchIndices" : "")
-         << ");";
-  }
-  return code.str();
 }
 
 std::string MatmulProgram::GenerateMatMulReadWriteFnSource(const std::vector<const ShaderVariableHelper*>& variables) const {
@@ -1747,5 +1848,230 @@ std::string MatmulProgram::GenerateMatMulReadWriteFnSource(const std::vector<con
 
   return code.str();
 }
+
+Status Conv2DMatMulProgram::GenerateShaderCode(ShaderHelper& shader) const {
+  // Setup input/output variables
+  const auto& input = shader.AddInput("x", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias |
+                                               ShaderUsage::UseUniform | ShaderUsage::UseShapeAndStride);
+  const auto& weights = shader.AddInput("w", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias |
+                                                 ShaderUsage::UseUniform | ShaderUsage::UseShapeAndStride);
+  const auto& output = shader.AddOutput("output", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias |
+                                                      ShaderUsage::UseUniform | ShaderUsage::UseShapeAndStride);
+
+  if (attributes_.has_bias) {
+    shader.AddInput("bias", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias);
+  }
+
+  const auto& batch_dims = shader.AddInput("batchDims", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias |
+                                                            ShaderUsage::UseOffsetToIndices);
+
+  // Calculate sizes and dimensions
+  const bool is_vec4 = attributes_.components == 4;
+  const uint32_t inner_element_size = is_vec4 ? (attributes_.is_channels_last && attributes_.channels % 4 != 0 ? 3 : 4) : 1;
+
+  const uint32_t tile_a_outer = attributes_.workgroup_size[1] * attributes_.elements_per_thread[1];
+  const uint32_t tile_b_outer = attributes_.workgroup_size[0] * attributes_.elements_per_thread[0];
+  const uint32_t tile_inner = std::max(attributes_.workgroup_size[0] * inner_element_size,
+                                       attributes_.workgroup_size[1]);
+
+  const bool fit_a_outer = attributes_.dim_a_outer % tile_a_outer == 0;
+  const bool fit_b_outer = attributes_.dim_b_outer % tile_b_outer == 0;
+  const bool fit_inner = attributes_.dim_inner % tile_inner == 0;
+
+  const std::array<uint32_t, 3> elements_size = is_vec4 ? std::array<uint32_t, 3>{inner_element_size, 4, 4} : std::array<uint32_t, 3>{1, 1, 1};
+
+  // Fill in declared function here.
+  shader.AdditionalImplementation()
+      << "fn getIndexFromCoords4D(coords : vec4<i32>, shape : vec4<i32>) -> i32 {\n"
+      << "  return dot(coords, vec4<i32>(\n"
+      << "      shape.y * shape.z * shape.w, shape.z * shape.w, shape.w, 1));\n"
+      << "}\n\n"
+      << "fn getOutputIndexFromCoords(coords : vec4<i32>) -> i32 {\n"
+      << "  return dot(coords, vec4<i32>(\n"
+      << "    uniforms.output_strides.x, uniforms.output_strides.y, uniforms.output_strides.z, 1));\n"
+      << "}\n\n"
+      << "fn setOutputAtIndex(flatIndex : i32, value : " << (is_vec4 ? "vec4<output_value_t>" : "output_value_t") << ") {\n"
+      << "  output[flatIndex] = value;\n"
+      << "}\n\n"
+      << "fn setOutputAtCoords(d0 : i32, d1 : i32, d2 : i32, d3 : i32, value : "
+      << (is_vec4 ? "vec4<output_value_t>" : "output_value_t") << ") {\n"
+      << "  let flatIndex = getOutputIndexFromCoords(vec4<i32>(d0, d1, d2, d3));\n"
+      << "  setOutputAtIndex(flatIndex" << (is_vec4 ? " / 4" : "") << ", value);\n"
+      << "}\n";
+
+  // Add bias function if needed
+  if (attributes_.has_bias) {
+    shader.AdditionalImplementation()
+        << "fn getBiasByOutputCoords(coords : vec4<i32>) -> "
+        << (is_vec4 ? "vec4<output_value_t>" : "output_value_t") << " {\n"
+        << "  return bias[coords." << (attributes_.is_channels_last ? "w" : "y")
+        << (is_vec4 ? " / 4" : "") << "];\n"
+        << "}\n";
+  }
+
+  // Generate Conv2D specific shader code using the helper
+  shader.AdditionalImplementation() << GenerateConv2DCommonSnippet(
+      attributes_.is_channels_last,
+      fit_a_outer,
+      fit_b_outer,
+      fit_inner,
+      attributes_.has_bias,
+      attributes_.activationAttributes,
+      "output_value_t",
+      elements_size[0],
+      elements_size[1],
+      elements_size[2]);
+
+  // Generate the matmul computation code
+  if (is_vec4) {
+    GenerateMatMulPackedVec4Code(shader.AdditionalImplementation(),
+                                 shader.MainFunctionBody(),
+                                 batch_dims,
+                                 attributes_.workgroup_size,
+                                 attributes_.elements_per_thread,
+                                 tile_inner);
+  } else {
+    GenerateMatMulPackedCode(shader.AdditionalImplementation(),
+                             shader.MainFunctionBody(),
+                             batch_dims,
+                             attributes_.workgroup_size,
+                             attributes_.elements_per_thread,
+                             tile_inner,
+                             false);  // kTransposeA = false
+  }
+
+  return Status::OK();
+}
+
+std::string Conv2DMatMulProgram::GetXSnippet(uint32_t inner_element_size, const std::string& data_type) const {
+  switch (inner_element_size) {
+    case 1:
+      return "resData = x[xIndex];";
+    case 3:
+      return "resData = vec3<" + data_type + ">(x[xIndex], x[xIndex + 1], x[xIndex + 2]);";
+    case 4:
+      return "resData = x[xIndex / 4];";
+    default:
+      ORT_THROW("innerElementSize ", inner_element_size, " is not supported.");
+  }
+}
+
+std::string Conv2DMatMulProgram::GetWSnippet(uint32_t inner_element_size) const {
+  switch (inner_element_size) {
+    case 1:
+      return "return w[row * i32(uniforms.w_shape[3]) + colIn];";
+    case 4:
+      return "return w[row * i32(uniforms.w_shape[3]) / 4 + colIn];";
+    default:
+      ORT_THROW("innerElementSize ", inner_element_size, " is not supported.");
+  }
+}
+
+std::string Conv2DMatMulProgram::GenerateTypeSnippet(uint32_t size, const std::string& data_type) const {
+  if (size == 1) return data_type;
+  return absl::StrCat("vec", size, "<", data_type, ">");
+}
+
+std::string Conv2DMatMulProgram::GenerateConv2DCommonSnippet(
+    bool is_channels_last,
+    bool fit_a_outer,
+    bool fit_b_outer,
+    bool fit_inner,
+    bool add_bias,
+    const InternalActivationAttributes& attributes,
+    const std::string& data_type,
+    uint32_t inner_element_size_x,
+    uint32_t inner_element_size_w,
+    uint32_t inner_element_size) const {
+  const std::string coord_a_snippet = is_channels_last
+                                          ? "let coord = vec4<i32>(batch, xRow, xCol, xCh);"
+                                          : "let coord = vec4<i32>(batch, xCh, xRow, xCol);";
+
+  const std::string coord_res_snippet = is_channels_last
+                                            ? "let coords = vec4<i32>(batch, row / outWidth, row % outWidth, col);"
+                                            : "let coords = vec4<i32>(batch, row, col / outWidth, col % outWidth);";
+
+  const std::string x_height = is_channels_last ? "i32(uniforms.x_shape[1])" : "i32(uniforms.x_shape[2])";
+  const std::string x_width = is_channels_last ? "i32(uniforms.x_shape[2])" : "i32(uniforms.x_shape[3])";
+  const std::string row = is_channels_last ? "row" : "col";
+  const std::string col = is_channels_last ? "col" : "row";
+
+  // Build read_x_snippet
+  std::stringstream read_x;
+  read_x << "let inChannels = i32(uniforms.w_shape[2]);\n"
+         << "let outWidth = " << (is_channels_last ? "i32(uniforms.result_shape[2])" : "i32(uniforms.result_shape[3])") << ";\n"
+         << "let outRow = " << row << " / outWidth;\n"
+         << "let outCol = " << row << " \% outWidth;\n\n"
+         << "let WRow = " << col << " / (i32(uniforms.w_shape[1]) * inChannels);\n"
+         << "let WCol = " << col << " / inChannels % i32(uniforms.w_shape[1]);\n"
+         << "let xRow = outRow * uniforms.stride[0] + uniforms.dilation[0] * WRow - uniforms.pad[0];\n"
+         << "let xCol = outCol * uniforms.stride[1] + uniforms.dilation[1] * WCol - uniforms.pad[1];\n"
+         << "let xCh = " << col << " % inChannels;\n"
+         << "var resData = " << GenerateTypeSnippet(inner_element_size_x, data_type) << "(0.0);\n"
+         << "if (xRow >= 0 && xRow < " << x_height << " && xCol >= 0 && xCol < " << x_width << ") {\n"
+         << "  " << coord_a_snippet << "\n"
+         << "  let xIndex = getIndexFromCoords4D(coord, vec4<i32>(uniforms.x_shape));\n"
+         << "  " << GetXSnippet(inner_element_size_x, data_type) << "\n"
+         << "}\n"
+         << "return resData;";
+
+  const std::string sample_x = is_channels_last
+                                   ? (fit_a_outer && fit_inner)
+                                         ? absl::StrCat("let col = colIn * ", inner_element_size_x, ";\n", read_x.str())
+                                         : absl::StrCat("let col = colIn * ", inner_element_size_x,
+                                                        ";\nif (row < uniforms.dim_a_outer && col < uniforms.dim_inner) {\n",
+                                                        read_x.str(), "\n}\nreturn ", GenerateTypeSnippet(inner_element_size_x, data_type), "(0.0);")
+                               : (fit_inner && fit_b_outer)
+                                   ? absl::StrCat("let col = colIn * ", inner_element_size_x, ";\n", read_x.str())
+                                   : absl::StrCat("let col = colIn * ", inner_element_size_x,
+                                                  ";\nif (row < uniforms.dim_inner && col < uniforms.dim_b_outer) {\n",
+                                                  read_x.str(), "\n}\nreturn ", GenerateTypeSnippet(inner_element_size_x, data_type), "(0.0);");
+
+  const std::string sample_w = is_channels_last
+                                   ? (fit_inner && fit_b_outer)
+                                         ? GetWSnippet(inner_element_size_w)
+                                         : absl::StrCat("let col = colIn * ", inner_element_size_w,
+                                                        ";\nif (row < uniforms.dim_inner && col < uniforms.dim_b_outer) {\n",
+                                                        GetWSnippet(inner_element_size_w), "\n}\nreturn ",
+                                                        GenerateTypeSnippet(inner_element_size_w, data_type), "(0.0);")
+                                   : absl::StrCat("let col = colIn * ", inner_element_size_w,
+                                                  ";\nif (row < uniforms.dim_inner && col < uniforms.dim_a_outer) {\n",
+                                                  GetWSnippet(inner_element_size_w), "\n}\nreturn ",
+                                                  GenerateTypeSnippet(inner_element_size_w, data_type), "(0.0);");
+
+  const std::string res_type = GenerateTypeSnippet(inner_element_size, data_type);
+  const std::string a_type = is_channels_last ? GenerateTypeSnippet(inner_element_size_x, data_type)
+                                              : GenerateTypeSnippet(inner_element_size_w, data_type);
+  const std::string b_type = is_channels_last ? GenerateTypeSnippet(inner_element_size_w, data_type)
+                                              : GenerateTypeSnippet(inner_element_size_x, data_type);
+
+  // Build final code
+  std::stringstream code;
+  code << "fn mm_readA(batch: i32, row: i32, colIn: i32) -> " << a_type << " {\n"
+       << "  " << (is_channels_last ? sample_x : sample_w) << "\n"
+       << "}\n\n"
+       << "fn mm_readB(batch: i32, row: i32, colIn: i32) -> " << b_type << " {\n"
+       << "  " << (is_channels_last ? sample_w : sample_x) << "\n"
+       << "}\n\n"
+       << "fn mm_write(batch: i32, row: i32, colIn: i32, valueIn: " << res_type << ") {\n"
+       << "  let col = colIn * " << inner_element_size << ";\n"
+       << "  if (row < uniforms.dim_a_outer && col < uniforms.dim_b_outer) {\n"
+       << "    var value = valueIn;\n"
+       << "    let outWidth = " << (is_channels_last ? "i32(uniforms.result_shape[2])" : "i32(uniforms.result_shape[3])") << ";\n"
+       << "    " << coord_res_snippet << "\n";
+
+  if (add_bias) {
+    code << "    let biasIndex = coords[" << (is_channels_last ? "3" : "1") << "];\n"
+         << "    value = value + bias[biasIndex];\n";
+  }
+
+  code << "    " << GetActivationSnippet(attributes, res_type, data_type) << "\n"
+       << "    setOutputAtCoords(coords[0], coords[1], coords[2], coords[3], value);\n"
+       << "  }\n"
+       << "}\n";
+
+  return code.str();
+}
+
 }  // namespace webgpu
 }  // namespace onnxruntime

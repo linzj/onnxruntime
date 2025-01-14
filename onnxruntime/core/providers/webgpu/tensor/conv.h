@@ -219,20 +219,62 @@ class MatmulProgram : public Program<MatmulProgram> {
       {"beta", ProgramUniformVariableDataType::Float32});
 
  private:
-  std::string GenerateReadBCode(const std::string& batch, const std::string& row,
-                                const std::string& col, const ShaderIndicesHelper& batchDims) const;
-
-  std::string GenerateComputationLoop(bool transposeA, uint32_t innerElementSize) const;
-
-  std::string GenerateOutputCode() const;
-
-  std::string GenerateStandardMatmulLoop(bool transposeA, uint32_t rowPerThreadA,
-                                         uint32_t colPerThreadA, uint32_t rowPerThreadB, const ShaderIndicesHelper& batchDims) const;
-  std::string WriteDataToSubAVec4Snippet(bool transposeA, const ShaderIndicesHelper& batchDims) const;
-
-  std::string WriteDataToSubASnippet(bool transposeA, const ShaderIndicesHelper& batchDims) const;
-
   std::string GenerateMatMulReadWriteFnSource(const std::vector<const ShaderVariableHelper*>& variables) const;
+};
+
+class Conv2DMatMulProgram : public Program<Conv2DMatMulProgram> {
+ public:
+  explicit Conv2DMatMulProgram() : Program("Conv2DMatMulProgram") {}
+
+  Status GenerateShaderCode(ShaderHelper& sh) const override;
+
+  struct Attributes {
+    uint32_t components;
+    bool has_bias;
+    bool is_channels_last;
+    InternalActivationAttributes activationAttributes;
+    std::vector<uint32_t> outer_dims;
+    std::vector<uint32_t> input_shape;
+    std::vector<uint32_t> weight_shape;
+    std::vector<uint32_t> output_shape;
+    std::array<uint32_t, 3> elements_per_thread;  // [4,4,1] or [4,1,1]
+    std::array<uint32_t, 3> workgroup_size;       // [8,8,1]
+    uint32_t channels;
+    uint32_t dim_a_outer;
+    uint32_t dim_b_outer;
+    uint32_t dim_inner;
+  };
+
+  Attributes attributes_;
+
+  // Define uniform variables
+  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
+      {"dim_a_outer", ProgramUniformVariableDataType::Int32},
+      {"dim_b_outer", ProgramUniformVariableDataType::Int32},
+      {"dim_inner", ProgramUniformVariableDataType::Int32},
+      {"pad", ProgramUniformVariableDataType::Int32},
+      {"stride", ProgramUniformVariableDataType::Int32},
+      {"dilation", ProgramUniformVariableDataType::Int32},
+      {"clipMax", ProgramUniformVariableDataType::Float32},
+      {"clipMin", ProgramUniformVariableDataType::Float32},
+      {"alpha", ProgramUniformVariableDataType::Float32},
+      {"beta", ProgramUniformVariableDataType::Float32});
+
+ private:
+  std::string GenerateConv2DCommonSnippet(bool is_channels_last,
+                                          bool fit_a_outer,
+                                          bool fit_b_outer,
+                                          bool fit_inner,
+                                          bool add_bias,
+                                          const InternalActivationAttributes&,
+                                          const std::string& data_type,
+                                          uint32_t inner_element_size_x,
+                                          uint32_t inner_element_size_w,
+                                          uint32_t inner_element_size) const;
+
+  std::string GetXSnippet(uint32_t inner_element_size, const std::string& data_type) const;
+  std::string GetWSnippet(uint32_t inner_element_size) const;
+  std::string GenerateTypeSnippet(uint32_t size, const std::string& data_type) const;
 };
 
 // Conv Kernel class for Conv operations
