@@ -8,6 +8,8 @@
 
 namespace onnxruntime {
 namespace webgpu {
+class ShaderIndicesHelper;
+class ShaderVariableHelper;
 
 enum class InternalActivationKind {
   kRelu,
@@ -180,6 +182,57 @@ class NaiveMatmulProgram : public Program<NaiveMatmulProgram> {
       {"M", ProgramUniformVariableDataType::Uint32},
       {"N", ProgramUniformVariableDataType::Uint32},
       {"K", ProgramUniformVariableDataType::Uint32}, );
+};
+
+class MatmulProgram : public Program<MatmulProgram> {
+ public:
+  explicit MatmulProgram() : Program("MatmulProgram") {}
+
+  Status GenerateShaderCode(ShaderHelper& sh) const override;
+
+  struct Attributes {
+    uint32_t components;
+    uint32_t batch_size;
+    uint32_t dim_a_outer;
+    uint32_t dim_inner;
+    uint32_t dim_b_outer;
+    bool has_bias;
+    bool is_channels_last;
+    InternalActivationAttributes activationAttributes;
+    std::vector<uint32_t> outer_dims;
+    std::vector<uint32_t> a_shape;
+    std::vector<uint32_t> b_shape;
+    std::array<uint32_t, 3> elements_per_thread;  // Add this
+    std::array<uint32_t, 3> workgroup_size;       // Add this
+  };
+
+  Attributes attributes_;
+
+  // Define uniform variables
+  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
+      {"dim_a_outer", ProgramUniformVariableDataType::Int32},
+      {"dim_b_outer", ProgramUniformVariableDataType::Int32},
+      {"dim_inner", ProgramUniformVariableDataType::Int32},
+      {"clipMax", ProgramUniformVariableDataType::Float32},
+      {"clipMin", ProgramUniformVariableDataType::Float32},
+      {"alpha", ProgramUniformVariableDataType::Float32},
+      {"beta", ProgramUniformVariableDataType::Float32});
+
+ private:
+  std::string GenerateReadBCode(const std::string& batch, const std::string& row,
+                                const std::string& col, const ShaderIndicesHelper& batchDims) const;
+
+  std::string GenerateComputationLoop(bool transposeA, uint32_t innerElementSize) const;
+
+  std::string GenerateOutputCode() const;
+
+  std::string GenerateStandardMatmulLoop(bool transposeA, uint32_t rowPerThreadA,
+                                         uint32_t colPerThreadA, uint32_t rowPerThreadB, const ShaderIndicesHelper& batchDims) const;
+  std::string WriteDataToSubAVec4Snippet(bool transposeA, const ShaderIndicesHelper& batchDims) const;
+
+  std::string WriteDataToSubASnippet(bool transposeA, const ShaderIndicesHelper& batchDims) const;
+
+  std::string GenerateMatMulReadWriteFnSource(const std::vector<const ShaderVariableHelper*>& variables) const;
 };
 
 // Conv Kernel class for Conv operations
