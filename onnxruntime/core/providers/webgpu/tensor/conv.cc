@@ -60,8 +60,8 @@ Status ParseInternalActivationAttributes(const OpKernelInfo& info, InternalActiv
 ConvAttributes ParseConvAttributes(const OpKernelInfo& info) {
   ConvAttributes convAttrs;
 
-  // Parse autoPad (default to "NOTSET" if not specified)
-  convAttrs.autoPad = static_cast<AutoPadKind>(static_cast<uint8_t>(info.GetAttrOrDefault<float>("autoPad", 0.0f)));
+  // Parse auto_pad (default to "NOTSET" if not specified)
+  convAttrs.auto_pad = static_cast<AutoPadKind>(static_cast<uint8_t>(info.GetAttrOrDefault<float>("auto_pad", 0.0f)));
 
   // Parse dilations
   gsl::span<const uint32_t> dilations_span;
@@ -69,8 +69,8 @@ ConvAttributes ParseConvAttributes(const OpKernelInfo& info) {
     convAttrs.dilations = std::vector<uint32_t>(dilations_span.begin(), dilations_span.end());
   }
 
-  // Parse kernelShape
-  convAttrs.kernelShape = info.GetAttrsOrDefault("kernelShape", {});
+  // Parse kernel_shape
+  convAttrs.kernel_shape = info.GetAttrsOrDefault("kernel_shape", {});
 
   // Parse pads
   convAttrs.pads = info.GetAttrsOrDefault("pads", {});
@@ -173,8 +173,8 @@ auto SqueezeShape(const gsl::span<const int64_t>& shape, const gsl::span<const s
 }
 
 // The program creator
-Status RunTransposeProgram(ComputeContext& context, const gsl::span<const size_t>& permutations, Tensor*& output_tensor) {
-  const auto* input_tensor = context.Input(0);
+Status RunTransposeProgram(ComputeContext& context, const gsl::span<const size_t>& permutations, Tensor& output_tensor) {
+  const auto* input_tensor = context.Input(1);
   const TensorShape& input_shape = input_tensor->Shape();
 
   // Compute output shape based on permutations
@@ -183,7 +183,7 @@ Status RunTransposeProgram(ComputeContext& context, const gsl::span<const size_t
     output_dims[i] = input_shape[permutations[i]];
   }
   TensorShape output_shape(output_dims);
-  output_tensor = context.Output(0, output_shape);
+  output_tensor = context.CreateGPUTensor(input_tensor->DataType(), output_shape);
 
   // Compute use_shared flag based on shape and permutations
   InlinedVector<int64_t> new_shape{};
@@ -217,7 +217,7 @@ Status RunTransposeProgram(ComputeContext& context, const gsl::span<const size_t
   program
       .CacheHint(absl::StrJoin(permutations, "-"))
       .AddInputs({{input_tensor, ProgramTensorMetadataDependency::TypeAndRank, new_input_shape, 1}})
-      .AddOutputs({{output_tensor, ProgramTensorMetadataDependency::None, new_output_shape, 1}})
+      .AddOutputs({{&output_tensor, ProgramTensorMetadataDependency::None, new_output_shape, 1}})
       .AddUniformVariables({
           {static_cast<uint32_t>(input_tensor->Shape().Size())},
       });
@@ -396,7 +396,7 @@ Status RunNaiveMatmulProgram(
     const InternalActivationAttributes& activationAttributes,
     const TensorShapeVector& outputShape,
     const TensorShapeVector& reshapedOutputShape,
-    bool isChannelsLast) {
+    bool is_channel_last) {
   // Extract dimensions
   const auto& a_shape = input_shapes[0].GetDims();
   const auto& b_shape = input_shapes[1].GetDims();
@@ -425,7 +425,7 @@ Status RunNaiveMatmulProgram(
   program->attributes_.a_components = a_components;
   program->attributes_.output_number = output_number;
   program->attributes_.has_bias = has_bias;
-  program->attributes_.isChannelsLast = isChannelsLast;
+  program->attributes_.is_channel_last = is_channel_last;
   program->attributes_.activationAttributes = activationAttributes;
   program->attributes_.M = static_cast<uint32_t>(M);
   program->attributes_.N = static_cast<uint32_t>(N);
@@ -437,7 +437,7 @@ Status RunNaiveMatmulProgram(
   program->AddInputs({{context.Input(0), ProgramTensorMetadataDependency::TypeAndRank, input_shapes[0].AsShapeVector(), static_cast<int>(a_components)}});
   program->AddInputs({{context.Input(1), ProgramTensorMetadataDependency::TypeAndRank, input_shapes[1].AsShapeVector(), static_cast<int>(components)}});
   if (has_bias) {
-    const auto bias_components = isChannelsLast ? components : 1;
+    const auto bias_components = is_channel_last ? components : 1;
     program->AddInputs({{context.Input(2),
                          ProgramTensorMetadataDependency::TypeAndRank,
                          input_shapes[2].AsShapeVector(), static_cast<int>(bias_components)}});
@@ -464,7 +464,7 @@ Status RunNaiveMatmulProgram(
 
   // Cache the program
   program->CacheHint(absl::StrJoin(
-      {std::to_string(components), std::to_string(a_components), std::to_string(output_number), std::to_string(isChannelsLast)}, ";"));
+      {std::to_string(components), std::to_string(a_components), std::to_string(output_number), std::to_string(is_channel_last)}, ";"));
 
   // Run the program
   return context.RunProgram(*program);
@@ -1063,9 +1063,9 @@ void Conv::ValidateInputs(const ComputeContext& context, const ConvAttributes& a
     ORT_THROW("Pads should be ", spatial_rank * 2, "D");
   }
 
-  // If kernelShape is specified, its size must be 2 less than the dimensions of the weights tensor
-  if (!attributes.kernelShape.empty() && attributes.kernelShape.size() != weights->Shape().NumDimensions() - 2) {
-    ORT_THROW("Invalid kernel shape: The kernelShape length should be ", weights->Shape().NumDimensions() - 2);
+  // If kernel_shape is specified, its size must be 2 less than the dimensions of the weights tensor
+  if (!attributes.kernel_shape.empty() && attributes.kernel_shape.size() != weights->Shape().NumDimensions() - 2) {
+    ORT_THROW("Invalid kernel shape: The kernel_shape length should be ", weights->Shape().NumDimensions() - 2);
   }
 }
 
@@ -1075,7 +1075,7 @@ void Conv::CalculateOutputShape(const ComputeContext& context, const ConvAttribu
   const auto& input_shape = input_tensor->Shape().GetDims();
 
   // Extract attributes
-  const auto& kernel_shape = attributes.kernelShape;
+  const auto& kernel_shape = attributes.kernel_shape;
   const auto& dilations = attributes.dilations;
   const auto& adjust_pads = attributes.pads;
   const auto& strides = attributes.strides;
@@ -1085,13 +1085,13 @@ void Conv::CalculateOutputShape(const ComputeContext& context, const ConvAttribu
   const int64_t batch_size = input_shape[0];
 
   // Extract input spatial shape (height, width)
-  const size_t spatial_rank = input_shape.size() - 2;  // Rank of spatial dimensions (2 for 2D convolution)
   TensorShapeVector input_spatial_shape;
   if (is_channel_last) {
     input_spatial_shape = TensorShapeVector(input_shape.begin() + 1, input_shape.end() - 1);
   } else {
     input_spatial_shape = TensorShapeVector(input_shape.begin() + 2, input_shape.end());
   }
+  const size_t spatial_rank = input_spatial_shape.size();  // Rank of spatial dimensions (2 for 2D convolution)
 
   // Extract output channels
   const int64_t out_channels = kernel_shape[0];
@@ -1152,7 +1152,8 @@ Status Conv::HandleConv3D(ComputeContext& context, const ConvAttributes& attribu
 // HandleConv2D - Convolution for 2D inputs (e.g., [batch_size, channels, height, width])
 Status Conv::HandleConv2D(ComputeContext& context, const ConvAttributes& attributes) const {
   // Check attributes
-  const bool is_channels_last = attributes.nchw;  // Assuming 'nchw' corresponds to 'NHWC' format
+  const bool is_channels_last = !attributes.nchw;
+  Tensor wT_storage;
 
   // Calculate output shape
   TensorShapeVector output_shape;
@@ -1169,12 +1170,11 @@ Status Conv::HandleConv2D(ComputeContext& context, const ConvAttributes& attribu
     if (is_channels_last) {
       if (!attributes.wT) {
         // Create and run the transpose program
-        Tensor* output_tensor;
-        std::vector<size_t> perm = {1, 0};                                       // Define permutation
-        ORT_RETURN_IF_ERROR(RunTransposeProgram(context, perm, output_tensor));  // Use the new interface
+        std::vector<size_t> perm = {2, 3, 1, 0};                              // Define permutation
+        ORT_RETURN_IF_ERROR(RunTransposeProgram(context, perm, wT_storage));  // Use the new interface
 
         // Store the transposed weight in attributes.wT
-        attributes.wT = output_tensor;
+        attributes.wT = &wT_storage;
       }
       conv_inputs.push_back(*attributes.wT);
     } else {
@@ -1237,13 +1237,12 @@ Status Conv::HandleConv2D(ComputeContext& context, const ConvAttributes& attribu
     if (is_channels_last) {
       if (!attributes.wT) {
         // Create and run the transpose program
-        std::vector<size_t> perm = {1, 0};  // Define permutation
-        Tensor* output_tensor;
+        std::vector<size_t> perm = {2, 3, 1, 0};  // Define permutation
 
-        ORT_THROW_IF_ERROR(RunTransposeProgram(context, perm, output_tensor));  // Assuming permAttr = [1, 0]
+        ORT_THROW_IF_ERROR(RunTransposeProgram(context, perm, wT_storage));  // Assuming permAttr = [1, 0]
 
         // Store the transposed weight in attributes.wT
-        attributes.wT = output_tensor;
+        attributes.wT = &wT_storage;
       }
 
       if (same_size) {
@@ -1287,11 +1286,10 @@ Status Conv::HandleConv2D(ComputeContext& context, const ConvAttributes& attribu
 
   // STEP 1: Transpose weight
   if (!attributes.wT) {
-    Tensor* output_tensor;
-    ORT_THROW_IF_ERROR(RunTransposeProgram(context, std::vector<std::size_t>({1, 0}), output_tensor));  // Assuming permAttr = [1, 0]
+    ORT_THROW_IF_ERROR(RunTransposeProgram(context, std::vector<std::size_t>({2, 3, 1, 0}), wT_storage));  // Assuming permAttr = [1, 0]
 
     // Store the transposed weight in attributes.wT
-    attributes.wT = output_tensor;
+    attributes.wT = &wT_storage;
   }
 
   // STEP 2: Prepare reshaped inputs
@@ -1313,119 +1311,119 @@ Status Conv::HandleConv2D(ComputeContext& context, const ConvAttributes& attribu
 ConvAttributes Conv::GetAdjustedConvAttributes(const ConvAttributes& attributes, const ComputeContext& context) const {
   ConvAttributes adjustedAttributes = attributes;
 
-  // Adjust kernelShape if not well specified
-  auto kernelShape = attributes.kernelShape;
-  if (kernelShape.size() < context.Input(1)->Shape().NumDimensions() - 2) {
+  // Adjust kernel_shape if not well specified
+  auto kernel_shape = attributes.kernel_shape;
+  if (kernel_shape.size() < context.Input(1)->Shape().NumDimensions() - 2) {
     // Fill missing dimensions with 0
-    kernelShape.resize(context.Input(1)->Shape().NumDimensions() - 2, 0);
+    kernel_shape.resize(context.Input(1)->Shape().NumDimensions() - 2, 0);
   }
 
-  // Infer kernelShape from the weight tensor dimensions
+  // Infer kernel_shape from the weight tensor dimensions
   for (size_t i = 2; i < context.Input(1)->Shape().NumDimensions(); ++i) {
-    if (kernelShape[i - 2] == 0) {
-      kernelShape[i - 2] = context.Input(1)->Shape()[i];
+    if (kernel_shape[i - 2] == 0) {
+      kernel_shape[i - 2] = context.Input(1)->Shape()[i];
     }
   }
 
-  // Adjust pads based on autoPad
+  // Adjust pads based on auto_pad
   TensorShapeVector pads = attributes.pads;
   AdjustPadsBasedOnAutoPad(
       context.Input(0)->Shape().AsShapeVector(),
       attributes.strides,
       TensorShapeVector(attributes.dilations.begin(), attributes.dilations.end()),
-      kernelShape,
+      kernel_shape,
       pads,
       attributes.nchw,  // Assuming 'nchw' corresponds to 'NHWC' format
-      attributes.autoPad);
+      attributes.auto_pad);
 
-  // Update adjustedAttributes with new kernelShape and pads
-  adjustedAttributes.kernelShape = kernelShape;
+  // Update adjustedAttributes with new kernel_shape and pads
+  adjustedAttributes.kernel_shape = kernel_shape;
   adjustedAttributes.pads = pads;
 
   return adjustedAttributes;
 }
 
 void Conv::AdjustPadsBasedOnAutoPad(
-    const TensorShapeVector& inputDims,
+    const TensorShapeVector& input_dims,
     const TensorShapeVector& strides,
     const TensorShapeVector& dilations,
-    const TensorShapeVector& kernelShape,
+    const TensorShapeVector& kernel_shape,
     TensorShapeVector& pads,
-    bool isChannelsLast,
-    AutoPadKind autoPad) const {
-  if (autoPad == AutoPadKind::kNotSet) {
+    bool is_channel_last,
+    AutoPadKind auto_pad) const {
+  if (auto_pad == AutoPadKind::kNotSet) {
     return;
   }
 
   // Validate input dimensions
-  if (pads.size() != 2 * (inputDims.size() - 2)) {
+  if (pads.size() != 2 * (input_dims.size() - 2)) {
     ORT_THROW("Length of pads should be twice the length of data dimensions.");
   }
 
-  if (strides.size() != inputDims.size() - 2) {
+  if (strides.size() != input_dims.size() - 2) {
     ORT_THROW("Length of strides should be the length of data dimensions.");
   }
 
-  if (kernelShape.size() != inputDims.size() - 2) {
+  if (kernel_shape.size() != input_dims.size() - 2) {
     ORT_THROW("Length of kernel shapes should be the length of data dimensions.");
   }
 
   // Adjust pads for each dimension
-  for (size_t dim = 0; dim < inputDims.size() - 2; ++dim) {
+  for (size_t dim = 0; dim < input_dims.size() - 2; ++dim) {
     AdjustPadAndReturnShape(
-        inputDims[dim + (isChannelsLast ? 1 : 2)],
+        input_dims[dim + (is_channel_last ? 1 : 2)],
         strides[dim],
         dilations[dim],
-        kernelShape[dim],
+        kernel_shape[dim],
         pads,
         dim,
-        dim + inputDims.size() - 2,
-        autoPad);
+        dim + input_dims.size() - 2,
+        auto_pad);
   }
 }
 
 int64_t Conv::AdjustPadAndReturnShape(
-    int64_t inputSize,
+    int64_t input_size,
     int64_t stride,
     int64_t dilation,
-    int64_t kernelSize,
+    int64_t kernel_size,
     TensorShapeVector& pads,
-    size_t padBeginIndex,
-    size_t padEndIndex,
-    AutoPadKind autoPad) const {
-  const int64_t dkernel = dilation * (kernelSize - 1) + 1;
+    size_t pad_begin_index,
+    size_t pad_end_index,
+    AutoPadKind auto_pad) const {
+  const int64_t dkernel = dilation * (kernel_size - 1) + 1;
 
-  if (autoPad != AutoPadKind::kNotSet) {
-    switch (autoPad) {
+  if (auto_pad != AutoPadKind::kNotSet) {
+    switch (auto_pad) {
       case AutoPadKind::kValid:
         // No padding
-        pads[padBeginIndex] = 0;
-        pads[padEndIndex] = 0;
-        return (inputSize - dkernel) / stride + 1;
+        pads[pad_begin_index] = 0;
+        pads[pad_end_index] = 0;
+        return (input_size - dkernel) / stride + 1;
 
       case AutoPadKind::kSameUpper:
       case AutoPadKind::kSameLower:
         if (dilation != 1) {
           ORT_THROW("Dilation not supported for SAME_UPPER or SAME_LOWER.");
         } else {
-          const int64_t legacyTargetSize = (inputSize + stride - 1) / stride;
-          const int64_t padNeeded = (legacyTargetSize - 1) * stride + kernelSize - inputSize;
+          const int64_t legacyTargetSize = (input_size + stride - 1) / stride;
+          const int64_t padNeeded = (legacyTargetSize - 1) * stride + kernel_size - input_size;
 
-          if (autoPad == AutoPadKind::kSameLower) {
-            pads[padBeginIndex] = (padNeeded + 1) / 2;
+          if (auto_pad == AutoPadKind::kSameLower) {
+            pads[pad_begin_index] = (padNeeded + 1) / 2;
           } else {
-            pads[padBeginIndex] = padNeeded / 2;
+            pads[pad_begin_index] = padNeeded / 2;
           }
-          pads[padEndIndex] = padNeeded - pads[padBeginIndex];
+          pads[pad_end_index] = padNeeded - pads[pad_begin_index];
 
-          return (inputSize + padNeeded - kernelSize) / stride + 1;
+          return (input_size + padNeeded - kernel_size) / stride + 1;
         }
 
       default:
         ORT_THROW("Unsupported AutoPad value.");
     }
   } else {
-    return (inputSize + pads[padBeginIndex] + pads[padEndIndex] - dkernel) / stride + 1;
+    return (input_size + pads[pad_begin_index] + pads[pad_end_index] - dkernel) / stride + 1;
   }
 }
 
@@ -1605,8 +1603,8 @@ Status NaiveMatmulProgram::GenerateShaderCode(ShaderHelper& shader) const {
   // Generate bias processing code
   std::string process_bias;
   if (attributes_.has_bias) {
-    const uint32_t biasComponents = attributes_.isChannelsLast ? attributes_.components : 1;
-    process_bias = attributes_.isChannelsLast
+    const uint32_t biasComponents = attributes_.is_channel_last ? attributes_.components : 1;
+    process_bias = attributes_.is_channel_last
                        ? absl::StrCat("value += bias[col / ", biasComponents, "];")
                        : absl::StrCat("value += ", "output_value_t", "(bias[row + i]);");
   }

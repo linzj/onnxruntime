@@ -35,14 +35,14 @@ struct InternalActivationAttributes {
 
 // Struct to hold convolution attributes
 struct ConvAttributes : InternalActivationAttributes {
-  AutoPadKind autoPad;
+  AutoPadKind auto_pad;
   std::vector<uint32_t> dilations;
   bool nchw;  // NHWC or NCHW
   int64_t group;
-  TensorShapeVector kernelShape;
+  TensorShapeVector kernel_shape;
   TensorShapeVector pads;
   TensorShapeVector strides;
-  mutable std::optional<Tensor*> wT;
+  mutable std::optional<const Tensor*> wT;
   bool wIsConst;
 };
 
@@ -127,7 +127,7 @@ class NaiveMatmulProgram : public Program<NaiveMatmulProgram> {
     uint32_t batchSize;
     uint32_t outputShapeSize;
     bool has_bias;
-    bool isChannelsLast;
+    bool is_channel_last;
     InternalActivationAttributes activationAttributes;
   };
 
@@ -252,15 +252,15 @@ class Conv : public WebGpuKernel {
   // Adjust convolution attributes based on input tensors
   ConvAttributes GetAdjustedConvAttributes(const ConvAttributes& attributes, const ComputeContext& context) const;
 
-  // Adjust padding values based on autoPad
+  // Adjust padding values based on auto_pad
   void AdjustPadsBasedOnAutoPad(
-      const TensorShapeVector& inputDims,
+      const TensorShapeVector& input_dims,
       const TensorShapeVector& strides,
       const TensorShapeVector& dilations,
-      const TensorShapeVector& kernelShape,
+      const TensorShapeVector& kernel_shape,
       TensorShapeVector& pads,
-      bool isChannelsLast,
-      AutoPadKind autoPad) const;
+      bool is_channel_last,
+      AutoPadKind auto_pad) const;
 
   // Helper function to adjust padding for a specific dimension
   int64_t AdjustPadAndReturnShape(
@@ -271,7 +271,7 @@ class Conv : public WebGpuKernel {
       TensorShapeVector& pads,
       size_t padBeginIndex,
       size_t padEndIndex,
-      AutoPadKind autoPad) const;
+      AutoPadKind auto_pad) const;
 };
 
 }  // namespace webgpu
