@@ -138,7 +138,11 @@ class NaiveMatmulProgram : public Program<NaiveMatmulProgram> {
       {"output_size", ProgramUniformVariableDataType::Uint32},
       {"M", ProgramUniformVariableDataType::Uint32},
       {"N", ProgramUniformVariableDataType::Uint32},
-      {"K", ProgramUniformVariableDataType::Uint32}, );
+      {"K", ProgramUniformVariableDataType::Uint32},
+      {"clipMax", ProgramUniformVariableDataType::Float32},
+      {"clipMin", ProgramUniformVariableDataType::Float32},
+      {"alpha", ProgramUniformVariableDataType::Float32},
+      {"beta", ProgramUniformVariableDataType::Float32});
 };
 
 class MatmulProgram : public Program<MatmulProgram> {

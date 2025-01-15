@@ -394,9 +394,9 @@ Status RunNaiveMatmulProgram(
     ComputeContext& context,
     const std::vector<const Tensor*>& inputs,
     const std::vector<const TensorShape>& input_shapes,
-    const InternalActivationAttributes& activationAttributes,
-    const TensorShapeVector& outputShape,
-    const TensorShapeVector& reshapedOutputShape,
+    const InternalActivationAttributes& activation_attributes,
+    const TensorShapeVector& output_shape,
+    const TensorShapeVector& reshaped_output_shape,
     bool is_channel_last) {
   // Extract dimensions
   const auto& a_shape = input_shapes[0].GetDims();
@@ -412,13 +412,13 @@ Status RunNaiveMatmulProgram(
   const uint32_t output_number = GetMaxComponents(M);
 
   // Calculate output dimensions
-  std::vector<uint32_t> outerDims;
-  for (size_t i = 0; i < reshapedOutputShape.size() - 2; ++i) {
-    outerDims.push_back(static_cast<uint32_t>(reshapedOutputShape[i]));
+  std::vector<uint32_t> outer_dims;
+  for (size_t i = 0; i < reshaped_output_shape.size() - 2; ++i) {
+    outer_dims.push_back(static_cast<uint32_t>(reshaped_output_shape[i]));
   }
-  const int64_t batchSize = std::accumulate(outerDims.begin(), outerDims.end(), static_cast<int64_t>(1), std::multiplies<int64_t>());
-  const TensorShapeVector outputShapeInShader{batchSize, M, N};
-  const size_t outputSize = TensorShape(outputShape).Size() / components / output_number;
+  const int64_t batch_size = std::accumulate(outer_dims.begin(), outer_dims.end(), static_cast<int64_t>(1), std::multiplies<int64_t>());
+  const TensorShapeVector output_shape_in_shader{batch_size, M, N};
+  const size_t output_size = TensorShape(output_shape).Size() / components / output_number;
 
   // Create and setup program
   auto program = std::make_unique<NaiveMatmulProgram>();
@@ -427,12 +427,12 @@ Status RunNaiveMatmulProgram(
   program->attributes_.output_number = output_number;
   program->attributes_.has_bias = has_bias;
   program->attributes_.is_channel_last = is_channel_last;
-  program->attributes_.activationAttributes = activationAttributes;
+  program->attributes_.activationAttributes = activation_attributes;
   program->attributes_.M = static_cast<uint32_t>(M);
   program->attributes_.N = static_cast<uint32_t>(N);
   program->attributes_.K = static_cast<uint32_t>(K);
-  program->attributes_.batchSize = static_cast<uint32_t>(batchSize);
-  program->attributes_.outputShapeSize = static_cast<uint32_t>(outputShape.size());
+  program->attributes_.batchSize = static_cast<uint32_t>(batch_size);
+  program->attributes_.outputShapeSize = static_cast<uint32_t>(output_shape.size());
 
   // Configure program inputs
   program->AddInputs({{inputs[0], ProgramTensorMetadataDependency::TypeAndRank, input_shapes[0].AsShapeVector(), static_cast<int>(a_components)}});
@@ -444,24 +444,26 @@ Status RunNaiveMatmulProgram(
                          input_shapes[2].AsShapeVector(), static_cast<int>(bias_components)}});
   }
   // allocate a Tensor object for outerDims
-  std::vector<int64_t> outerDimsInt64(outerDims.begin(), outerDims.end());
-  auto outerDimsTensor = context.CreateGPUTensor(inputs[0]->DataType(), TensorShape(outerDimsInt64));
-  program->AddInputs({{&outerDimsTensor, ProgramTensorMetadataDependency::TypeAndRank}});
+  std::vector<int64_t> outer_dims_int64(outer_dims.begin(), outer_dims.end());
+  auto outer_dims_tensor = context.CreateGPUTensor(inputs[0]->DataType(), TensorShape(outer_dims_int64));
+  program->AddInputs({{&outer_dims_tensor, ProgramTensorMetadataDependency::TypeAndRank}});
 
   // Configure program outputs
-  auto* output_tensor = context.Output(0, TensorShape(outputShape));
+  auto* output_tensor = context.Output(0, TensorShape(output_shape));
   program->AddOutput({output_tensor, ProgramTensorMetadataDependency::None});
 
   // Set dispatch size
-  program->SetDispatchGroupSize((static_cast<uint32_t>(outputSize) + 63) / 64);
+  program->SetDispatchGroupSize((static_cast<uint32_t>(output_size) + 63) / 64);
 
   // Add uniform variables
-  program->AddUniformVariables({
-      {static_cast<uint32_t>(outputSize)},
-      {static_cast<uint32_t>(M)},
-      {static_cast<uint32_t>(N)},
-      {static_cast<uint32_t>(K)},
-  });
+  program->AddUniformVariables({{static_cast<uint32_t>(output_size)},
+                                {static_cast<uint32_t>(M)},
+                                {static_cast<uint32_t>(N)},
+                                {static_cast<uint32_t>(K)},
+                                {activation_attributes.clipMax.has_value() ? activation_attributes.clipMax.value() : 3.4028234663852886e38f},
+                                {activation_attributes.clipMin.has_value() ? activation_attributes.clipMin.value() : -3.4028234663852886e38f},
+                                {activation_attributes.alpha.has_value() ? activation_attributes.alpha.value() : 0.2f},
+                                {activation_attributes.beta.has_value() ? activation_attributes.beta.value() : 0.5f}});
 
   // Cache the program
   program->CacheHint(absl::StrJoin(
@@ -1606,7 +1608,7 @@ Status NaiveMatmulProgram::GenerateShaderCode(ShaderHelper& shader) const {
   }
   const auto& batch_dims = shader.AddInput("batchDims", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias | ShaderUsage::UseOffsetToIndices);
 
-  const std::string_view base_type = "output_value_t";
+  const std::string_view base_type = output.StorageType();
   const std::string apply_activation = GetActivationSnippet(attributes_.activationAttributes, "output_value_t", std::string(base_type));
 
   // Generate bias processing code
