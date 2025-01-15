@@ -233,13 +233,12 @@ class Conv2DMatMulProgram : public Program<Conv2DMatMulProgram> {
     bool has_bias;
     bool is_channels_last;
     InternalActivationAttributes activationAttributes;
-    std::vector<uint32_t> outer_dims;
     std::vector<uint32_t> input_shape;
     std::vector<uint32_t> weight_shape;
     std::vector<uint32_t> output_shape;
     std::array<uint32_t, 3> elements_per_thread;  // [4,4,1] or [4,1,1]
     std::array<uint32_t, 3> workgroup_size;       // [8,8,1]
-    uint32_t channels;
+    uint32_t in_channels;
     uint32_t dim_a_outer;
     uint32_t dim_b_outer;
     uint32_t dim_inner;

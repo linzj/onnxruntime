@@ -600,8 +600,8 @@ Status RunConv2DMatMulProgram(
     int64_t dim_b_outer,
     int64_t dim_inner,
     bool has_bias,
-    bool sequential_access_by_threads,
-    Tensor*& output_tensor) {
+    bool sequential_access_by_threads) {
+  Tensor* output_tensor;
   // Calculate output shape and create output tensor
   output_tensor = context.Output(0, TensorShape(output_shape));
 
@@ -609,42 +609,48 @@ Status RunConv2DMatMulProgram(
   auto program = std::make_unique<Conv2DMatMulProgram>();
 
   // Setup general attributes
-  const auto outer_dims = std::vector<uint32_t>(output_shape.begin(), output_shape.end() - 2);
   const bool is_channels_last = !attributes.nchw;
-  const bool is_vec4 = dim_inner % 4 == 0 && dim_b_outer % 4 == 0;
+  const uint32_t input_channels = is_channels_last ? static_cast<uint32_t>(inputs[0]->Shape()[3]) : static_cast<uint32_t>(inputs[0]->Shape()[1]);
+  const int64_t batch_size = output_shape[0];
+  // Calculate dispatch sizes based on layout and dimensions
+  const uint32_t out_width = is_channels_last ? static_cast<uint32_t>(output_shape[2]) : static_cast<uint32_t>(output_shape[3]);
+  const uint32_t out_height = is_channels_last ? static_cast<uint32_t>(output_shape[1]) : static_cast<uint32_t>(output_shape[2]);
+  const uint32_t out_channels = is_channels_last ? static_cast<uint32_t>(output_shape[3]) : static_cast<uint32_t>(output_shape[1]);
+  const bool is_vec4 = is_channels_last &&
+                       (input_channels % 4 == 0 || input_channels % 3 == 0) &&
+                       out_channels % 4 == 0;
+
   const uint32_t components = is_vec4 ? 4 : 1;
 
+  // Calculate dispatch dimensions
+  const uint32_t dispatch_x = is_channels_last ? out_channels : out_width * out_height;
+  const uint32_t dispatch_y = is_channels_last ? out_width * out_height : out_channels;
+
+  // Set workgroup size
+  const std::array<uint32_t, 3> workgroup_size = {8, 8, 1};
   // Set elements per thread based on input dimensions
-  std::array<uint32_t, 3> elements_per_thread = {
+  const std::array<uint32_t, 3> elements_per_thread = {
       4,
       dim_a_outer <= 8 ? 1u : 4u,
       1};
 
-  // Set workgroup size
-  std::array<uint32_t, 3> workgroup_size = {8, 8, 1};
+  // Calculate final dispatch size based on workgroup and elements per thread
+  const std::array<uint32_t, 3> dispatch_size = {
+      static_cast<uint32_t>(ceil(static_cast<float>(dispatch_x) /
+                                 (workgroup_size[0] * elements_per_thread[0]))),
+      static_cast<uint32_t>(ceil(static_cast<float>(dispatch_y) /
+                                 (workgroup_size[1] * elements_per_thread[1]))),
+      static_cast<uint32_t>(ceil(static_cast<float>(batch_size) /
+                                 (workgroup_size[2] * elements_per_thread[2])))};
 
   // Setup program attributes
   program->attributes_.components = components;
   program->attributes_.has_bias = has_bias;
   program->attributes_.is_channels_last = is_channels_last;
   program->attributes_.activationAttributes = attributes;
-  program->attributes_.outer_dims = outer_dims;
   program->attributes_.elements_per_thread = elements_per_thread;
   program->attributes_.workgroup_size = workgroup_size;
-
-  // Get input channels dimension based on layout
-  const uint32_t input_channels = static_cast<uint32_t>(
-      is_channels_last ? inputs[0]->Shape()[3] : inputs[0]->Shape()[1]);
-
-  // Setup program attributes
-  program->attributes_.components = components;
-  program->attributes_.has_bias = has_bias;
-  program->attributes_.is_channels_last = is_channels_last;
-  program->attributes_.activationAttributes = attributes;
-  program->attributes_.outer_dims = outer_dims;
-  program->attributes_.elements_per_thread = elements_per_thread;
-  program->attributes_.workgroup_size = workgroup_size;
-  program->attributes_.channels = input_channels;                         // Set channels
+  program->attributes_.in_channels = input_channels;                      // Set channels
   program->attributes_.dim_a_outer = static_cast<uint32_t>(dim_a_outer);  // Set dim_a_outer
   program->attributes_.dim_b_outer = static_cast<uint32_t>(dim_b_outer);  // Set dim_a_outer
   program->attributes_.dim_inner = static_cast<uint32_t>(dim_inner);      // Set dim_inner
@@ -653,18 +659,9 @@ Status RunConv2DMatMulProgram(
   program->AddInputs({{inputs[0], ProgramTensorMetadataDependency::TypeAndShape}});
   program->AddInputs({{inputs[1], ProgramTensorMetadataDependency::TypeAndShape}});
   if (has_bias) {
-    program->AddInputs({{inputs[2], ProgramTensorMetadataDependency::None}});
+    program->AddInputs({{inputs[2], ProgramTensorMetadataDependency::TypeAndShape}});
   }
   program->AddOutput({output_tensor, ProgramTensorMetadataDependency::None});
-
-  // Calculate dispatch size
-  const std::array<uint32_t, 3> dispatch_size = {
-      static_cast<uint32_t>(ceil(static_cast<float>(dim_b_outer) /
-                                 (workgroup_size[0] * elements_per_thread[0]))),
-      static_cast<uint32_t>(ceil(static_cast<float>(dim_a_outer) /
-                                 (workgroup_size[1] * elements_per_thread[1]))),
-      static_cast<uint32_t>(ceil(static_cast<float>(TensorShape(output_shape).Size()) /
-                                 (workgroup_size[2] * elements_per_thread[2])))};
 
   // Set dispatch parameters
   program->SetDispatchGroupSize(dispatch_size[0], dispatch_size[1], dispatch_size[2]);
@@ -674,6 +671,10 @@ Status RunConv2DMatMulProgram(
   program->AddUniformVariables({{static_cast<int32_t>(dim_a_outer)},
                                 {static_cast<int32_t>(dim_b_outer)},
                                 {static_cast<int32_t>(dim_inner)},
+                                {std::vector<int32_t>{static_cast<int32_t>(attributes.pads[0]), static_cast<int32_t>(attributes.pads[1])}},
+                                {std::vector<uint32_t>{static_cast<uint32_t>(attributes.strides[0]),
+                                                       static_cast<uint32_t>(attributes.strides[1])}},
+                                {attributes.dilations},
                                 {attributes.clipMax.has_value() ? attributes.clipMax.value() : 3.4028234663852886e38f},
                                 {attributes.clipMin.has_value() ? attributes.clipMin.value() : -3.4028234663852886e38f},
                                 {attributes.alpha.has_value() ? attributes.alpha.value() : 0.2f},
@@ -727,45 +728,45 @@ std::string GetActivationSnippet(
 }
 
 // Helper functions moved from MatmulProgram class to anonymous namespace
-std::string WriteDataToSubAVec4SnippetImpl(bool transposeA, const ShaderIndicesHelper& batchDims) {
+std::string WriteDataToSubAVec4SnippetImpl(bool transpose_a, const ShaderIndicesHelper* batch_dims) {
   std::stringstream code;
-  if (transposeA) {
+  if (transpose_a) {
     code << "mm_Asub[inputRow][inputCol] = mm_readA(batch, kStart + inputRow, "
-         << "globalRowStart / innerElementSize + inputCol" << (batchDims.Rank() > 0 ? ", batchIndices" : "") << ");";
+         << "globalRowStart / innerElementSize + inputCol" << ((batch_dims && batch_dims->Rank() > 0) ? ", batchIndices" : "") << ");";
   } else {
     code << "mm_Asub[inputRow][inputCol] = mm_readA(batch, globalRowStart + inputRow, "
-         << "kStart / innerElementSize + inputCol" << (batchDims.Rank() > 0 ? ", batchIndices" : "") << ");";
+         << "kStart / innerElementSize + inputCol" << ((batch_dims && batch_dims->Rank() > 0) ? ", batchIndices" : "") << ");";
   }
   return code.str();
 }
 
-std::string WriteDataToSubASnippetImpl(bool transposeA, const ShaderIndicesHelper& batchDims) {
+std::string WriteDataToSubASnippetImpl(bool transpose_a, const ShaderIndicesHelper* batch_dims) {
   std::stringstream code;
-  if (transposeA) {
+  if (transpose_a) {
     code << "mm_Asub[inputRow][inputCol] = mm_readA(batch, "
          << "kStart + inputRow, "
          << "globalRowStart + inputCol"
-         << (batchDims.Rank() > 0 ? ", batchIndices" : "")
+         << ((batch_dims && batch_dims->Rank() > 0) ? ", batchIndices" : "")
          << ");";
   } else {
     code << "mm_Asub[inputRow][inputCol] = mm_readA(batch, "
          << "globalRowStart + inputRow, "
          << "kStart + inputCol"
-         << (batchDims.Rank() > 0 ? ", batchIndices" : "")
+         << ((batch_dims && batch_dims->Rank() > 0) ? ", batchIndices" : "")
          << ");";
   }
   return code.str();
 }
 
 std::string GenerateReadBCodeImpl(const std::string& batch, const std::string& row,
-                                  const std::string& col, const ShaderIndicesHelper& batchDims) {
+                                  const std::string& col, const ShaderIndicesHelper* batch_dims) {
   std::stringstream code;
   code << "mm_readB(" << batch << ", " << row << ", " << col
-       << (batchDims.Rank() > 0 ? ", batchIndices" : "") << ")";
+       << ((batch_dims && batch_dims->Rank() > 0) ? ", batchIndices" : "") << ")";
   return code.str();
 }
 
-std::string GenerateComputationLoopImpl(bool transposeA, uint32_t inner_element_size) {
+std::string GenerateComputationLoopImpl(bool transpose_a, uint32_t inner_element_size) {
   std::stringstream code;
   code << "    for (var k = 0; k < tileInner; k = k + 1) {\n"
        << "        let BCached0 = mm_Bsub[k][globalCol / 4];\n\n"
@@ -775,7 +776,7 @@ std::string GenerateComputationLoopImpl(bool transposeA, uint32_t inner_element_
     code << "        let BCached3 = mm_Bsub[k * innerElementSize + 3][tileCol];\n";
   }
 
-  if (transposeA) {
+  if (transpose_a) {
     code << "        let ACached0 = mm_Asub[k * innerElementSize][localRow];\n"
          << "        let ACached1 = mm_Asub[k * innerElementSize + 1][localRow];\n"
          << "        let ACached2 = mm_Asub[k * innerElementSize + 2][localRow];\n";
@@ -815,7 +816,7 @@ std::string GenerateOutputCodeImpl() {
 
 void GenerateMatMulPackedVec4Code(OStringStream& additional_implementation,
                                   OStringStream& main_function_body,
-                                  const ShaderIndicesHelper& batch_dims,
+                                  const ShaderIndicesHelper* batch_dims,
                                   const std::array<uint32_t, 3>& workgroup_size,
                                   const std::array<uint32_t, 3>& elements_per_thread,
                                   uint32_t inner_element_size) {
@@ -845,8 +846,8 @@ void GenerateMatMulPackedVec4Code(OStringStream& additional_implementation,
       << "let globalCol = i32(globalId.x);\n"
       << "let batch = i32(globalId.z);\n";
 
-  if (batch_dims.Rank() > 0) {
-    main_function_body << "let batchIndices = " << batch_dims.OffsetToIndices("u32(batch)") << ";\n";
+  if (batch_dims && batch_dims->Rank() > 0) {
+    main_function_body << "let batchIndices = " << batch_dims->OffsetToIndices("u32(batch)") << ";\n";
   }
 
   main_function_body
@@ -880,7 +881,7 @@ void GenerateMatMulPackedVec4Code(OStringStream& additional_implementation,
 
 void GenerateMatMulPackedCode(OStringStream& additional_implementation,
                               OStringStream& main_function_body,
-                              const ShaderIndicesHelper& batch_dims,
+                              const ShaderIndicesHelper* batch_dims,
                               const std::array<uint32_t, 3>& workgroup_size,
                               const std::array<uint32_t, 3>& elements_per_thread,
                               uint32_t tile_inner, const bool kTransposeA) {
@@ -912,8 +913,8 @@ void GenerateMatMulPackedCode(OStringStream& additional_implementation,
       << "let tileRowB = i32(localId.y) * " << row_per_thread_b << ";\n\n"
       << "let batch = i32(globalId.z);\n";
 
-  if (batch_dims.Rank() > 0) {
-    main_function_body << "let batchIndices = " << batch_dims.OffsetToIndices("u32(batch)") << ";\n";
+  if (batch_dims && batch_dims->Rank() > 0) {
+    main_function_body << "let batchIndices = " << batch_dims->OffsetToIndices("u32(batch)") << ";\n";
   }
 
   main_function_body
@@ -1362,9 +1363,8 @@ Status Conv::HandleConv2D(ComputeContext& context, const ConvAttributes& attribu
   const int64_t dim_b_outer = is_channels_last ? out_channels : out_height * out_width;
   const int64_t dim_inner = weight_height * weight_width * input_channels;
 
-  Tensor* output_tensor;
   ORT_RETURN_IF_ERROR(RunConv2DMatMulProgram(
-      context, conv_inputs, attributes, output_shape, dim_a_outer, dim_b_outer, dim_inner, has_bias, sequential_access_by_threads, output_tensor));
+      context, conv_inputs, attributes, output_shape, dim_a_outer, dim_b_outer, dim_inner, has_bias, sequential_access_by_threads));
   return Status::OK();
 }
 
@@ -1759,7 +1759,7 @@ Status MatmulProgram::GenerateShaderCode(ShaderHelper& shader) const {
     // For vec4 implementation
     GenerateMatMulPackedVec4Code(shader.AdditionalImplementation(),
                                  shader.MainFunctionBody(),
-                                 batch_dims,
+                                 &batch_dims,
                                  attributes_.workgroup_size,
                                  attributes_.elements_per_thread,
                                  kTileInner);
@@ -1767,7 +1767,7 @@ Status MatmulProgram::GenerateShaderCode(ShaderHelper& shader) const {
     // For standard implementation
     GenerateMatMulPackedCode(shader.AdditionalImplementation(),
                              shader.MainFunctionBody(),
-                             batch_dims,
+                             &batch_dims,
                              attributes_.workgroup_size,
                              attributes_.elements_per_thread,
                              kTileInner, kTransposeA);
@@ -1851,23 +1851,20 @@ std::string MatmulProgram::GenerateMatMulReadWriteFnSource(const std::vector<con
 
 Status Conv2DMatMulProgram::GenerateShaderCode(ShaderHelper& shader) const {
   // Setup input/output variables
-  const auto& input = shader.AddInput("x", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias |
-                                               ShaderUsage::UseUniform | ShaderUsage::UseShapeAndStride);
-  const auto& weights = shader.AddInput("w", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias |
-                                                 ShaderUsage::UseUniform | ShaderUsage::UseShapeAndStride);
-  const auto& output = shader.AddOutput("output", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias |
-                                                      ShaderUsage::UseUniform | ShaderUsage::UseShapeAndStride);
+  shader.AddInput("x", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias |
+                           ShaderUsage::UseUniform | ShaderUsage::UseShapeAndStride);
+  shader.AddInput("w", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias |
+                           ShaderUsage::UseUniform | ShaderUsage::UseShapeAndStride);
+  shader.AddOutput("output", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias |
+                                 ShaderUsage::UseUniform | ShaderUsage::UseShapeAndStride);
 
   if (attributes_.has_bias) {
     shader.AddInput("bias", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias);
   }
 
-  const auto& batch_dims = shader.AddInput("batchDims", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias |
-                                                            ShaderUsage::UseOffsetToIndices);
-
   // Calculate sizes and dimensions
   const bool is_vec4 = attributes_.components == 4;
-  const uint32_t inner_element_size = is_vec4 ? (attributes_.is_channels_last && attributes_.channels % 4 != 0 ? 3 : 4) : 1;
+  const uint32_t inner_element_size = is_vec4 ? (attributes_.is_channels_last && attributes_.in_channels % 4 != 0 ? 3 : 4) : 1;
 
   const uint32_t tile_a_outer = attributes_.workgroup_size[1] * attributes_.elements_per_thread[1];
   const uint32_t tile_b_outer = attributes_.workgroup_size[0] * attributes_.elements_per_thread[0];
@@ -1888,7 +1885,7 @@ Status Conv2DMatMulProgram::GenerateShaderCode(ShaderHelper& shader) const {
       << "}\n\n"
       << "fn getOutputIndexFromCoords(coords : vec4<i32>) -> i32 {\n"
       << "  return dot(coords, vec4<i32>(\n"
-      << "    uniforms.output_strides.x, uniforms.output_strides.y, uniforms.output_strides.z, 1));\n"
+      << "    uniforms.output_stride.x, uniforms.output_stride.y, uniforms.output_stride.z, 1));\n"
       << "}\n\n"
       << "fn setOutputAtIndex(flatIndex : i32, value : " << (is_vec4 ? "vec4<output_value_t>" : "output_value_t") << ") {\n"
       << "  output[flatIndex] = value;\n"
@@ -1926,14 +1923,14 @@ Status Conv2DMatMulProgram::GenerateShaderCode(ShaderHelper& shader) const {
   if (is_vec4) {
     GenerateMatMulPackedVec4Code(shader.AdditionalImplementation(),
                                  shader.MainFunctionBody(),
-                                 batch_dims,
+                                 nullptr,
                                  attributes_.workgroup_size,
                                  attributes_.elements_per_thread,
                                  tile_inner);
   } else {
     GenerateMatMulPackedCode(shader.AdditionalImplementation(),
                              shader.MainFunctionBody(),
-                             batch_dims,
+                             nullptr,
                              attributes_.workgroup_size,
                              attributes_.elements_per_thread,
                              tile_inner,
@@ -1968,8 +1965,18 @@ std::string Conv2DMatMulProgram::GetWSnippet(uint32_t inner_element_size) const 
 }
 
 std::string Conv2DMatMulProgram::GenerateTypeSnippet(uint32_t size, const std::string& data_type) const {
-  if (size == 1) return data_type;
-  return absl::StrCat("vec", size, "<", data_type, ">");
+  switch (size) {
+    case 1:
+      return data_type;
+    case 2:
+      return "vec2<" + data_type + ">";
+    case 3:
+      return "vec3<" + data_type + ">";
+    case 4:
+      return "vec4<" + data_type + ">";
+    default:
+      ORT_THROW(size, "-component is not supported.");
+  }
 }
 
 std::string Conv2DMatMulProgram::GenerateConv2DCommonSnippet(
@@ -1988,8 +1995,8 @@ std::string Conv2DMatMulProgram::GenerateConv2DCommonSnippet(
                                           : "let coord = vec4<i32>(batch, xCh, xRow, xCol);";
 
   const std::string coord_res_snippet = is_channels_last
-                                            ? "let coords = vec4<i32>(batch, row / outWidth, row % outWidth, col);"
-                                            : "let coords = vec4<i32>(batch, row, col / outWidth, col % outWidth);";
+                                            ? "let coords = vec4<i32>(batch, row / outWidth, row \% outWidth, col);"
+                                            : "let coords = vec4<i32>(batch, row, col / outWidth, col \% outWidth);";
 
   const std::string x_height = is_channels_last ? "i32(uniforms.x_shape[1])" : "i32(uniforms.x_shape[2])";
   const std::string x_width = is_channels_last ? "i32(uniforms.x_shape[2])" : "i32(uniforms.x_shape[3])";
@@ -2061,8 +2068,7 @@ std::string Conv2DMatMulProgram::GenerateConv2DCommonSnippet(
        << "    " << coord_res_snippet << "\n";
 
   if (add_bias) {
-    code << "    let biasIndex = coords[" << (is_channels_last ? "3" : "1") << "];\n"
-         << "    value = value + bias[biasIndex];\n";
+    code << "    value = value + getBiasByOutputCoords(coords);\n";
   }
 
   code << "    " << GetActivationSnippet(attributes, res_type, data_type) << "\n"
