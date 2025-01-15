@@ -484,8 +484,8 @@ Status RunMatmulProgram(
   if (inputs.size() > 2) {
     bias = inputs[2];
   }
-  const auto& a_shape = A->Shape();
-  const auto& b_shape = B->Shape();
+  const auto& a_shape = input_shapes[0];
+  const auto& b_shape = input_shapes[1];
   const int64_t a_rank = a_shape.NumDimensions();
   const int64_t b_rank = b_shape.NumDimensions();
 
@@ -548,7 +548,8 @@ Status RunMatmulProgram(
   program->AddInputs({{A, ProgramTensorMetadataDependency::TypeAndShape, a_shape_tensor, static_cast<int>(components)}});
   program->AddInputs({{B, ProgramTensorMetadataDependency::TypeAndShape, b_shape_tensor, static_cast<int>(components)}});
   if (bias) {
-    program->AddInputs({{bias, ProgramTensorMetadataDependency::TypeAndRank}});
+    const auto biasComponents = is_channels_last ? components : 1;
+    program->AddInputs({{bias, ProgramTensorMetadataDependency::TypeAndRank, input_shapes[2].GetDims(), static_cast<int>(biasComponents)}});
   }
   // allocate a Tensor object for outerDims
   std::vector<int64_t> outer_dims_int64(outer_dims.begin(), outer_dims.end());
@@ -1249,9 +1250,9 @@ Status Conv::HandleConv2D(ComputeContext& context, const ConvAttributes& attribu
       }
 
       if (same_size) {
-        const int64_t sharedDim = input_height * input_width * input_channels;
-        x_reshaped = {1, batch, sharedDim};
-        w_reshaped = {1, sharedDim, out_channels};
+        const int64_t shared_dim = input_height * input_width * input_channels;
+        x_reshaped = {1, batch, shared_dim};
+        w_reshaped = {1, shared_dim, out_channels};
         mat_mul_output_shape = {1, batch, out_channels};
       } else {
         x_reshaped = {batch, input_height * input_width, input_channels};
@@ -1260,14 +1261,14 @@ Status Conv::HandleConv2D(ComputeContext& context, const ConvAttributes& attribu
       }
       mat_mul_inputs.emplace_back(context.Input(0));
       mat_mul_inputs.emplace_back(&wT_storage);
-      mat_mul_input_shapes.push_back(x_reshaped);
-      mat_mul_input_shapes.push_back(w_reshaped);
+      mat_mul_input_shapes.emplace_back(x_reshaped);
+      mat_mul_input_shapes.emplace_back(w_reshaped);
     } else {
       x_reshaped = {batch, input_channels, input_height * input_width};
       w_reshaped = {1, out_channels, input_channels};
       mat_mul_output_shape = {batch, out_channels, out_height * out_width};
-      mat_mul_input_shapes.push_back(w_reshaped);
-      mat_mul_input_shapes.push_back(x_reshaped);
+      mat_mul_input_shapes.emplace_back(w_reshaped);
+      mat_mul_input_shapes.emplace_back(x_reshaped);
       mat_mul_inputs.emplace_back(context.Input(0));
       mat_mul_inputs.emplace_back(context.Input(1));
     }
