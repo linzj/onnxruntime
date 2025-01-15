@@ -46,49 +46,6 @@ struct ConvAttributes : InternalActivationAttributes {
   bool wIsConst;
 };
 
-// Conv1D2DProgram class for Conv1D and Conv2D
-class Conv1D2DProgram : public Program<Conv1D2DProgram> {
- public:
-  explicit Conv1D2DProgram();
-
-  Status GenerateShaderCode(ShaderHelper& sh) const override;
-
-  ConvAttributes attributes_;
-
-  // Define uniform variables specific to Conv1D/2D
-  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
-      {"dim_a_outer", ProgramUniformVariableDataType::Int32},
-      {"dim_b_outer", ProgramUniformVariableDataType::Int32},
-      {"dim_inner", ProgramUniformVariableDataType::Int32},
-      {"pad", ProgramUniformVariableDataType::Int32},
-      {"stride", ProgramUniformVariableDataType::Int32},
-      {"dilation", ProgramUniformVariableDataType::Int32});
-
-  // Helper functions
-  static std::string ConvAttributesToWGSL(const ConvAttributes& attributes);
-};
-
-// Conv3DProgram class for Conv3D
-class Conv3DProgram : public Program<Conv3DProgram> {
- public:
-  explicit Conv3DProgram();
-
-  Status GenerateShaderCode(ShaderHelper& sh) const override;
-
-  ConvAttributes attributes_;
-
-  // Define uniform variables specific to Conv3D
-  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
-      {"output_size", ProgramUniformVariableDataType::Uint32},
-      {"filter_dims", ProgramUniformVariableDataType::Uint32},
-      {"pads", ProgramUniformVariableDataType::Uint32},
-      {"strides", ProgramUniformVariableDataType::Uint32},
-      {"dilations", ProgramUniformVariableDataType::Uint32});
-
-  // Helper functions
-  static std::string ConvAttributesToWGSL(const ConvAttributes& attributes);
-};
-
 // Add after the TransposeShared program class:
 class GroupedConvVectorizeProgram : public Program<GroupedConvVectorizeProgram> {
  public:

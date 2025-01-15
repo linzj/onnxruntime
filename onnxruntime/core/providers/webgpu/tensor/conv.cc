@@ -970,64 +970,6 @@ void GenerateMatMulPackedCode(OStringStream& additional_implementation,
 
 }  // namespace
 
-// Conv1D2DProgram Implementation
-
-Conv1D2DProgram::Conv1D2DProgram() : Program("Conv1D2DProgram") {
-  // Initialize default values or other necessary setup if required
-}
-
-Status Conv1D2DProgram::GenerateShaderCode(ShaderHelper& sh) const {
-  // Implement shader code generation logic for Conv1D and Conv2D
-  // This will include defining the shader source, handling uniforms, and utilizing helper functions
-  // Example:
-  // sh.AddFunction(...);
-  // sh.AddMainFunction(...);
-
-  // Placeholder implementation:
-  return Status::OK();
-}
-
-std::string Conv1D2DProgram::ConvAttributesToWGSL(const ConvAttributes& attributes) {
-  // Convert ConvAttributes to WGSL shader code strings, like padding, dilation, etc.
-  // Example:
-  // std::ostringstream wgsl_code;
-  // wgsl_code << "let stride = vec2<i32>(" << attributes.strides[0] << ", " << attributes.strides[1] << ");\n";
-  // ... (additional conversions)
-  // return wgsl_code.str();
-
-  // Placeholder implementation:
-  return "";
-}
-
-// Conv3DProgram Implementation
-
-Conv3DProgram::Conv3DProgram() : Program("Conv3DProgram") {
-  // Initialize default values or other necessary setup if required
-}
-
-Status Conv3DProgram::GenerateShaderCode(ShaderHelper& sh) const {
-  // Implement shader code generation logic for Conv3D
-  // This will include defining the shader source, handling uniforms, and utilizing helper functions
-  // Example:
-  // sh.AddFunction(...);
-  // sh.AddMainFunction(...);
-
-  // Placeholder implementation:
-  return Status::OK();
-}
-
-std::string Conv3DProgram::ConvAttributesToWGSL(const ConvAttributes& attributes) {
-  // Convert ConvAttributes to WGSL shader code strings specific to Conv3D
-  // Example:
-  // std::ostringstream wgsl_code;
-  // wgsl_code << "let stride = vec3<i32>(" << attributes.strides[0] << ", " << attributes.strides[1] << ", " << attributes.strides[2] << ");\n";
-  // ... (additional conversions)
-  // return wgsl_code.str();
-
-  // Placeholder implementation:
-  return "";
-}
-
 // Conv Kernel Implementation
 
 Conv::Conv(const OpKernelInfo& info) : WebGpuKernel(info) {
