@@ -392,6 +392,7 @@ Status RunGroupedConvProgram(
 
 Status RunNaiveMatmulProgram(
     ComputeContext& context,
+    const std::vector<const Tensor*>& inputs,
     const std::vector<const TensorShape>& input_shapes,
     const InternalActivationAttributes& activationAttributes,
     const TensorShapeVector& outputShape,
@@ -434,17 +435,17 @@ Status RunNaiveMatmulProgram(
   program->attributes_.outputShapeSize = static_cast<uint32_t>(outputShape.size());
 
   // Configure program inputs
-  program->AddInputs({{context.Input(0), ProgramTensorMetadataDependency::TypeAndRank, input_shapes[0].AsShapeVector(), static_cast<int>(a_components)}});
-  program->AddInputs({{context.Input(1), ProgramTensorMetadataDependency::TypeAndRank, input_shapes[1].AsShapeVector(), static_cast<int>(components)}});
+  program->AddInputs({{inputs[0], ProgramTensorMetadataDependency::TypeAndRank, input_shapes[0].AsShapeVector(), static_cast<int>(a_components)}});
+  program->AddInputs({{inputs[1], ProgramTensorMetadataDependency::TypeAndRank, input_shapes[1].AsShapeVector(), static_cast<int>(components)}});
   if (has_bias) {
     const auto bias_components = is_channel_last ? components : 1;
-    program->AddInputs({{context.Input(2),
+    program->AddInputs({{inputs[2],
                          ProgramTensorMetadataDependency::TypeAndRank,
                          input_shapes[2].AsShapeVector(), static_cast<int>(bias_components)}});
   }
   // allocate a Tensor object for outerDims
   std::vector<int64_t> outerDimsInt64(outerDims.begin(), outerDims.end());
-  auto outerDimsTensor = context.CreateGPUTensor(context.Input(0)->DataType(), TensorShape(outerDimsInt64));
+  auto outerDimsTensor = context.CreateGPUTensor(inputs[0]->DataType(), TensorShape(outerDimsInt64));
   program->AddInputs({{&outerDimsTensor, ProgramTensorMetadataDependency::TypeAndRank}});
 
   // Configure program outputs
@@ -472,15 +473,16 @@ Status RunNaiveMatmulProgram(
 
 Status RunMatmulProgram(
     ComputeContext& context,
+    const std::vector<const Tensor*>& inputs,
     const std::vector<const TensorShape>& input_shapes,
     const InternalActivationAttributes& activation_attributes,
     const TensorShapeVector& output_shape, const TensorShapeVector* reshapedOutputShape, bool is_channels_last) {
   // Calculate shapes and dimensions
-  const Tensor* A = context.Input(0);
-  const Tensor* B = context.Input(1);
+  const Tensor* A = inputs[0];
+  const Tensor* B = inputs[1];
   const Tensor* bias = nullptr;
-  if (context.InputCount() > 2) {
-    bias = context.Input(2);
+  if (inputs.size() > 2) {
+    bias = inputs[2];
   }
   const auto& a_shape = A->Shape();
   const auto& b_shape = B->Shape();
@@ -1232,7 +1234,8 @@ Status Conv::HandleConv2D(ComputeContext& context, const ConvAttributes& attribu
     TensorShapeVector x_reshaped;
     TensorShapeVector w_reshaped;
     TensorShapeVector mat_mul_output_shape;
-    std::vector<const TensorShape> mat_mul_inputs;
+    std::vector<const TensorShape> mat_mul_input_shapes;
+    std::vector<const Tensor*> mat_mul_inputs;
 
     if (is_channels_last) {
       if (!attributes.wT) {
@@ -1255,28 +1258,33 @@ Status Conv::HandleConv2D(ComputeContext& context, const ConvAttributes& attribu
         w_reshaped = {1, input_channels, out_channels};
         mat_mul_output_shape = {batch, out_height * out_width, out_channels};
       }
-      mat_mul_inputs.push_back(x_reshaped);
-      mat_mul_inputs.push_back(w_reshaped);
+      mat_mul_inputs.emplace_back(context.Input(0));
+      mat_mul_inputs.emplace_back(&wT_storage);
+      mat_mul_input_shapes.push_back(x_reshaped);
+      mat_mul_input_shapes.push_back(w_reshaped);
     } else {
       x_reshaped = {batch, input_channels, input_height * input_width};
       w_reshaped = {1, out_channels, input_channels};
       mat_mul_output_shape = {batch, out_channels, out_height * out_width};
-      mat_mul_inputs.push_back(w_reshaped);
-      mat_mul_inputs.push_back(x_reshaped);
+      mat_mul_input_shapes.push_back(w_reshaped);
+      mat_mul_input_shapes.push_back(x_reshaped);
+      mat_mul_inputs.emplace_back(context.Input(0));
+      mat_mul_inputs.emplace_back(context.Input(1));
     }
 
     if (has_bias) {
-      mat_mul_inputs.push_back(bias_tensor->Shape().AsShapeVector());
+      mat_mul_input_shapes.push_back(bias_tensor->Shape().AsShapeVector());
+      mat_mul_inputs.emplace_back(bias_tensor);
     }
 
     const int64_t N = mat_mul_output_shape[2];
-    const int64_t K = mat_mul_inputs[0].GetDims().back();
+    const int64_t K = mat_mul_input_shapes[0].GetDims().back();
     if (N < 8 && K < 8) {
       ORT_RETURN_IF_ERROR(RunNaiveMatmulProgram(
-          context, mat_mul_inputs, attributes, output_shape, mat_mul_output_shape, is_channels_last));
+          context, mat_mul_inputs, mat_mul_input_shapes, attributes, output_shape, mat_mul_output_shape, is_channels_last));
       return Status::OK();
     } else {
-      ORT_RETURN_IF_ERROR(RunMatmulProgram(context, mat_mul_inputs, attributes, output_shape, &mat_mul_output_shape, is_channels_last));
+      ORT_RETURN_IF_ERROR(RunMatmulProgram(context, mat_mul_inputs, mat_mul_input_shapes, attributes, output_shape, &mat_mul_output_shape, is_channels_last));
       return Status::OK();
     }
   }
