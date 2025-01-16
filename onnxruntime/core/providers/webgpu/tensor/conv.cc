@@ -556,7 +556,7 @@ Status RunMatmulProgram(
   // allocate a Tensor object for outerDims
   std::vector<int64_t> outer_dims_int64(outer_dims.begin(), outer_dims.end());
   auto outer_dims_tensor = context.CreateGPUTensor(A->DataType(), TensorShape(outer_dims_int64));
-  program->AddInputs({{&outer_dims_tensor, ProgramTensorMetadataDependency::TypeAndRank, 1}});
+  program->AddInputs({{&outer_dims_tensor, ProgramTensorMetadataDependency::TypeAndShape, 1}});
 
   program->AddOutput({context.Output(0, output_shape_tensor), ProgramTensorMetadataDependency::None, output_shape_tensor, static_cast<int>(components)});
 
@@ -1458,12 +1458,12 @@ Status GroupedConvVectorizeProgram::GenerateShaderCode(ShaderHelper& shader) con
 
   // Calculate indices and positions
   code << "let width0 = uniforms.output_shape[3];\n"
-       << "let output_channel = global_idx % width0;\n"
+       << "let output_channel = global_idx %% width0;\n"
        << "var index1 = global_idx / width0;\n"
        << "let width1 = uniforms.output_shape[2] / " << attributes_.output_number << "u;\n"
-       << "let col = (index1 % width1) * " << attributes_.output_number << "u;\n"
+       << "let col = (index1 %% width1) * " << attributes_.output_number << "u;\n"
        << "index1 = index1 / width1;\n"
-       << "let row = index1 % uniforms.output_shape[1];\n"
+       << "let row = index1 %% uniforms.output_shape[1];\n"
        << "let batch = index1 / uniforms.output_shape[1];\n\n";
 
   // Calculate corner position
@@ -1646,12 +1646,12 @@ Status NaiveMatmulProgram::GenerateShaderCode(ShaderHelper& shader) const {
   };
 
   // Build the main shader code
-  std::stringstream code;
+  OStringStream& code = shader.MainFunctionBody();
   code << shader.GuardAgainstOutOfBoundsWorkgroupSizes("uniforms.output_size") << "\n\n"
-       << "let col = (global_idx % (uniforms.N / " << attributes_.components << ")) * " << attributes_.components << ";\n"
+       << "let col = (global_idx %% (uniforms.N / " << attributes_.components << ")) * " << attributes_.components << ";\n"
        << "var index1 = global_idx / (uniforms.N / " << attributes_.components << ");\n"
        << "let stride1 = uniforms.M / " << attributes_.output_number << ";\n"
-       << "let row = (index1 % stride1) * " << attributes_.output_number << ";\n"
+       << "let row = (index1 %% stride1) * " << attributes_.output_number << ";\n"
        << "let batch = index1 / stride1;\n\n";
 
   // Add batch indices calculation if needed
@@ -1683,7 +1683,6 @@ Status NaiveMatmulProgram::GenerateShaderCode(ShaderHelper& shader) const {
        << "  " << output.SetByOffset("offset / " + std::to_string(attributes_.components), "value") << ";\n"
        << "}\n";
 
-  shader.MainFunctionBody() << code.str();
   return Status::OK();
 }
 
@@ -1735,8 +1734,8 @@ std::string MatmulProgram::GenerateMatMulReadWriteFnSource(const std::vector<con
   const auto& output = *variables[3];      // Output
 
   const std::string type_snippet = (attributes_.components > 1)
-                                       ? absl::StrCat("vec", attributes_.components, "<", "output_value_t", ">")
-                                       : "output_value_t";
+                                       ? absl::StrCat("vec", attributes_.components, "<", std::string(batch_dims.ValueType()), ">")
+                                       : std::string(batch_dims.ValueType());
   const std::string zero_value = absl::StrCat(type_snippet, "(0.0)");
 
   // Generate read/write function code
@@ -1946,8 +1945,8 @@ std::string Conv2DMatMulProgram::GenerateConv2DCommonSnippet(
                                           : "let coord = vec4<i32>(batch, xCh, xRow, xCol);";
 
   const std::string coord_res_snippet = is_channels_last
-                                            ? "let coords = vec4<i32>(batch, row / outWidth, row \% outWidth, col);"
-                                            : "let coords = vec4<i32>(batch, row, col / outWidth, col \% outWidth);";
+                                            ? "let coords = vec4<i32>(batch, row / outWidth, row %% outWidth, col);"
+                                            : "let coords = vec4<i32>(batch, row, col / outWidth, col %% outWidth);";
 
   const std::string x_height = is_channels_last ? "i32(uniforms.x_shape[1])" : "i32(uniforms.x_shape[2])";
   const std::string x_width = is_channels_last ? "i32(uniforms.x_shape[2])" : "i32(uniforms.x_shape[3])";
@@ -1959,12 +1958,12 @@ std::string Conv2DMatMulProgram::GenerateConv2DCommonSnippet(
   read_x << "let inChannels = i32(uniforms.w_shape[2]);\n"
          << "let outWidth = " << (is_channels_last ? "i32(uniforms.result_shape[2])" : "i32(uniforms.result_shape[3])") << ";\n"
          << "let outRow = " << row << " / outWidth;\n"
-         << "let outCol = " << row << " \% outWidth;\n\n"
+         << "let outCol = " << row << " %% outWidth;\n\n"
          << "let WRow = " << col << " / (i32(uniforms.w_shape[1]) * inChannels);\n"
-         << "let WCol = " << col << " / inChannels % i32(uniforms.w_shape[1]);\n"
+         << "let WCol = " << col << " / inChannels %% i32(uniforms.w_shape[1]);\n"
          << "let xRow = outRow * uniforms.stride[0] + uniforms.dilation[0] * WRow - uniforms.pad[0];\n"
          << "let xCol = outCol * uniforms.stride[1] + uniforms.dilation[1] * WCol - uniforms.pad[1];\n"
-         << "let xCh = " << col << " % inChannels;\n"
+         << "let xCh = " << col << " %% inChannels;\n"
          << "var resData = " << GenerateTypeSnippet(inner_element_size_x, data_type) << "(0.0);\n"
          << "if (xRow >= 0 && xRow < " << x_height << " && xCol >= 0 && xCol < " << x_width << ") {\n"
          << "  " << coord_a_snippet << "\n"
