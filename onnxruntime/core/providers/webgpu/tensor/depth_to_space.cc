@@ -1,9 +1,28 @@
 #include "depth_to_space.h"
 #include "core/providers/webgpu/shader_helper.h"
-#include <sstream>
+#include "core/providers/webgpu/webgpu_supported_types.h"
 
 namespace onnxruntime {
 namespace webgpu {
+
+// DepthToSpace operator declarations
+ONNX_OPERATOR_VERSIONED_KERNEL_EX(
+    DepthToSpace,
+    kOnnxDomain,
+    11, 12,
+    kWebGpuExecutionProvider,
+    (*KernelDefBuilder::Create())
+        .TypeConstraint("T", WebGpuSupportedNumberTypes()),
+    DepthToSpace);
+
+ONNX_OPERATOR_KERNEL_EX(
+    DepthToSpace,
+    kOnnxDomain,
+    13,
+    kWebGpuExecutionProvider,
+    (*KernelDefBuilder::Create())
+        .TypeConstraint("T", WebGpuSupportedNumberTypes()),
+    DepthToSpace);
 
 DepthToSpace::DepthToSpace(const OpKernelInfo& info) : WebGpuKernel(info) {
   // Parse attributes

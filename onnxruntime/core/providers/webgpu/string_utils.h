@@ -42,5 +42,17 @@ inline void OStringStreamAppend(std::ostream& ss, const Args&... args) {
 
 }  // namespace detail
 
+class Printable {
+ public:
+  std::function<void(std::ostream&)> Print;
+  Printable(std::function<void(std::ostream&)> Print)
+      : Print(std::move(Print)) {}
+};
+
+inline std::ostream& operator<<(std::ostream& os, const Printable& p) {
+  p.Print(os);
+  return os;
+}
+
 }  // namespace webgpu
 }  // namespace onnxruntime

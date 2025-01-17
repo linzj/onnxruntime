@@ -1,11 +1,30 @@
 // conv.cc
-#include "conv.h"
+#include "core/providers/webgpu/tensor/conv.h"
 #include "core/providers/webgpu/shader_helper.h"
 #include "core/providers/webgpu/tensor/transpose.h"
 #include <string>
 
 namespace onnxruntime {
 namespace webgpu {
+
+// Conv operator declarations
+ONNX_OPERATOR_VERSIONED_KERNEL_EX(
+    Conv,
+    kOnnxDomain,
+    1, 10,
+    kWebGpuExecutionProvider,
+    (*KernelDefBuilder::Create())
+        .TypeConstraint("T", WebGpuSupportedNumberTypes()),
+    Conv);
+
+ONNX_OPERATOR_KERNEL_EX(
+    Conv,
+    kOnnxDomain,
+    11,
+    kWebGpuExecutionProvider,
+    (*KernelDefBuilder::Create())
+        .TypeConstraint("T", WebGpuSupportedNumberTypes()),
+    Conv);
 
 namespace {
 
