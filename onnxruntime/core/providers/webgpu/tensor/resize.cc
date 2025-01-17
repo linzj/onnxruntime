@@ -1,5 +1,5 @@
 // resize.cc
-#include "resize.h"
+#include "core/providers/webgpu/tensor/resize.h"
 
 #include <algorithm>
 #include <cmath>
@@ -24,25 +24,27 @@ struct hash<std::vector<T>> {
 namespace onnxruntime {
 namespace webgpu {
 
-#define WEBGPU_RESIZE_VERSIONED_KERNEL(start, end)            \
-  ONNX_OPERATOR_VERSIONED_KERNEL_EX(                          \
-      Resize,                                                 \
-      kOnnxDomain,                                            \
-      start,                                                  \
-      end,                                                    \
-      kWebGpuExecutionProvider,                               \
-      (*KernelDefBuilder::Create())                           \
-          .TypeConstraint("T", WebGpuSupportedNumberTypes()), \
+#define WEBGPU_RESIZE_VERSIONED_KERNEL(start, end)             \
+  ONNX_OPERATOR_VERSIONED_KERNEL_EX(                           \
+      Resize,                                                  \
+      kOnnxDomain,                                             \
+      start,                                                   \
+      end,                                                     \
+      kWebGpuExecutionProvider,                                \
+      (*KernelDefBuilder::Create())                            \
+          .TypeConstraint("T1", WebGpuSupportedNumberTypes())  \
+          .TypeConstraint("T2", WebGpuSupportedNumberTypes()), \
       Resize);
 
-#define WEBGPU_RESIZE_KERNEL(version)                         \
-  ONNX_OPERATOR_KERNEL_EX(                                    \
-      Resize,                                                 \
-      kOnnxDomain,                                            \
-      version,                                                \
-      kWebGpuExecutionProvider,                               \
-      (*KernelDefBuilder::Create())                           \
-          .TypeConstraint("T", WebGpuSupportedNumberTypes()), \
+#define WEBGPU_RESIZE_KERNEL(version)                          \
+  ONNX_OPERATOR_KERNEL_EX(                                     \
+      Resize,                                                  \
+      kOnnxDomain,                                             \
+      version,                                                 \
+      kWebGpuExecutionProvider,                                \
+      (*KernelDefBuilder::Create())                            \
+          .TypeConstraint("T1", WebGpuSupportedNumberTypes())  \
+          .TypeConstraint("T2", WebGpuSupportedNumberTypes()), \
       Resize);
 
 WEBGPU_RESIZE_VERSIONED_KERNEL(10, 10)
@@ -474,7 +476,7 @@ std::string ResizeProgram::NearestModeToWGSL(NearestMode mode, int opset_version
 // ResizeProgram: GenerateShaderCode implementation
 Status ResizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
   // Declare input and output variables using ShaderVariableHelper with appropriate usage flags
-  const ShaderVariableHelper& input = shader.AddInput("input", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias);
+  const ShaderVariableHelper& input = shader.AddInput("input", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias);
   const ShaderVariableHelper& output = shader.AddOutput("output", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias);
 
   // Initialize a string stream to build additional WGSL implementations
