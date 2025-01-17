@@ -52,20 +52,18 @@ WEBGPU_RESIZE_VERSIONED_KERNEL(18, 18)
 WEBGPU_RESIZE_KERNEL(19)
 
 namespace {
-std::string SetChannelAndBatchIndices(
+Printable SetChannelAndBatchIndices(
     const ShaderIndicesHelper& input,
     int channel_idx,
     int batch_idx,
     int special_dims) {
-  std::ostringstream result;
-
-  if (input.Rank() > special_dims) {
-    // Assuming indicesSet is a function in ShaderIndicesHelper
-    result << input.IndicesSet("input_indices", channel_idx, "channel") << ";\n";
-    result << input.IndicesSet("input_indices", batch_idx, "batch") << ";\n";
-  }
-
-  return result.str();
+  return Printable([&](std::ostream& code) {
+    if (input.Rank() > special_dims) {
+      // Assuming indicesSet is a function in ShaderIndicesHelper
+      code << input.IndicesSet("input_indices", channel_idx, "channel") << ";\n";
+      code << input.IndicesSet("input_indices", batch_idx, "batch") << ";\n";
+    }
+  });
 }
 
 // Helper functions to convert strings to enums
@@ -85,7 +83,7 @@ CoordinateTransformMode ParseCoordinateTransformMode(const std::string& mode_str
   } else if (mode_str == "half_pixel_symmetric") {
     return CoordinateTransformMode::HalfPixelSymmetric;
   } else {
-    throw std::invalid_argument("Unsupported CoordinateTransformMode: " + mode_str);
+    ORT_THROW("Unsupported CoordinateTransformMode: ", mode_str);
   }
 }
 
@@ -97,7 +95,7 @@ KeepAspectRatioPolicy ParseKeepAspectRatioPolicy(const std::string& policy_str) 
   } else if (policy_str == "not_larger") {
     return KeepAspectRatioPolicy::NotLarger;
   } else {
-    throw std::invalid_argument("Unsupported KeepAspectRatioPolicy: " + policy_str);
+    ORT_THROW("Unsupported KeepAspectRatioPolicy: ", policy_str);
   }
 }
 
@@ -109,7 +107,7 @@ Mode ParseMode(const std::string& mode_str) {
   } else if (mode_str == "cubic") {
     return Mode::Cubic;
   } else {
-    throw std::invalid_argument("Unsupported Mode: " + mode_str);
+    ORT_THROW("Unsupported Mode: ", mode_str);
   }
 }
 
@@ -125,7 +123,7 @@ NearestMode ParseNearestMode(const std::string& mode_str) {
   } else if (mode_str == "simple" || mode_str.empty()) {
     return NearestMode::Simple;
   } else {
-    throw std::invalid_argument("Unsupported NearestMode: " + mode_str);
+    ORT_THROW("Unsupported NearestMode: ", mode_str);
   }
 }
 
@@ -170,7 +168,7 @@ std::vector<float> UpdateScales(const std::vector<float>& scales, const gsl::spa
   // Validate axes
   for (const auto& axis : axes) {
     if (axis < 0 || axis >= rank) {
-      throw std::invalid_argument("Resize requires axes input values to be positive and less than rank");
+      ORT_THROW("Resize requires axes input values to be positive and less than rank");
     }
   }
 
@@ -211,7 +209,7 @@ std::vector<int64_t> InitOutputShape(const gsl::span<const int64_t>& input_shape
 
       // Check that axes is not out of bounds
       if (static_cast<size_t>(*std::max_element(axes.begin(), axes.end())) > input_shape.size()) {
-        throw std::out_of_range("axes is out of bound");
+        ORT_THROW("axes is out of bound");
       }
 
       // Set values in outputShape based on axes and sizes
@@ -224,7 +222,7 @@ std::vector<int64_t> InitOutputShape(const gsl::span<const int64_t>& input_shape
     }
   } else {
     if (scales.empty()) {
-      throw std::invalid_argument("Resize requires either scales or sizes.");
+      ORT_THROW("Resize requires either scales or sizes.");
     } else {
       // Scale inputShape using scales and round the values
       for (size_t i = 0; i < input_shape.size(); ++i) {
@@ -256,7 +254,7 @@ std::vector<int64_t> AdjustOutputShape(const gsl::span<const int64_t>& input_sha
         return *std::max_element(scales.begin(), scales.end());
       }
     } else {
-      throw std::invalid_argument("Keep aspect ratio policy " + ResizeProgram::KeepAspectRatioPolicyToWGSL(attributes.keepAspectRatioPolicy) + " is not supported");
+      ORT_THROW("Keep aspect ratio policy ", ResizeProgram::KeepAspectRatioPolicyToWGSL(attributes.keepAspectRatioPolicy), " is not supported");
     }
   }();
 
@@ -291,7 +289,7 @@ void Resize::ValidateScales(const std::vector<float>& scales, const ResizeAttrib
   // All scale values must be positive
   for (const auto& scale : scales) {
     if (scale <= 0.0f) {
-      throw std::invalid_argument("Resize requires scales input values to be positive");
+      ORT_THROW("Resize requires scales input values to be positive");
     }
   }
 
@@ -303,14 +301,14 @@ void Resize::ValidateScales(const std::vector<float>& scales, const ResizeAttrib
                     (scales.size() == 4 && scales[0] == 1.0f && scales[3] == 1.0f) ||
                     (scales.size() == 5 && scales[0] == 1.0f && scales[1] == 1.0f));
       if (!valid) {
-        throw std::invalid_argument("For linear mode, Resize requires scales to be 2D, 3D, 4D with either two outermost or one innermost and one outermost scale values equal to 1, or 5D with two outermost scale values equal to 1");
+        ORT_THROW("For linear mode, Resize requires scales to be 2D, 3D, 4D with either two outermost or one innermost and one outermost scale values equal to 1, or 5D with two outermost scale values equal to 1");
       }
     } else if (attributes.mode == Mode::Cubic) {
       bool valid = (scales.size() == 2 ||
                     (scales.size() == 4 && scales[0] == 1.0f && scales[1] == 1.0f) ||
                     (scales.size() == 4 && scales[0] == 1.0f && scales[3] == 1.0f));
       if (!valid) {
-        throw std::invalid_argument("Resize requires scales input size to be 2 or 4 for cubic mode");
+        ORT_THROW("Reize requires scales input size to be 2 or 4 for cubic mode");
       }
     }
   }
@@ -347,7 +345,7 @@ void Resize::ValidateInputs(const ComputeContext& context,
     size_t roi_size = roi_tensor->Shape().Size();
     roi.assign(roi_data, roi_data + roi_size);
   } else if (attributes.coordinateTransformMode == CoordinateTransformMode::TfCropAndResize) {
-    throw std::invalid_argument("Resize requires RoI input to be specified when coordinateTransformMode is tfCropAndResize");
+    ORT_THROW("Resize requires RoI input to be specified when coordinateTransformMode is tfCropAndResize");
   }
 
   // Handle scales input
@@ -363,7 +361,7 @@ void Resize::ValidateInputs(const ComputeContext& context,
         scales.size() != static_cast<size_t>(rank) &&
         opsetVersion >= 18 &&
         scales.size() != attributes.axes.size()) {
-      throw std::invalid_argument("Resize requires scales input size to be same as input rank or axes size for opset 18 and up");
+      ORT_THROW("Resize requires scales input size to be same as input rank or axes size for opset 18 and up");
     }
 
     ValidateScales(scales, attributes);
@@ -386,22 +384,22 @@ void Resize::ValidateInputs(const ComputeContext& context,
         sizes.size() != static_cast<size_t>(rank) &&
         opsetVersion >= 18 &&
         sizes.size() != attributes.axes.size()) {
-      throw std::invalid_argument("Resize requires sizes input size to be same as input rank or axes size for opset 18 and up");
+      ORT_THROW("Resize requires sizes input size to be same as input rank or axes size for opset 18 and up");
     }
   }
 
   // Additional checks
   if (!attributes.axes.empty()) {
     if (!scales.empty() && scales.size() != attributes.axes.size()) {
-      throw std::invalid_argument("Resize requires 'scales' input size to be of axes rank when axes attributes is specified");
+      ORT_THROW("Resize requires 'scales' input size to be of axes rank when axes attributes is specified");
     }
     if (!sizes.empty() && sizes.size() != attributes.axes.size()) {
-      throw std::invalid_argument("Resize requires 'sizes' input size to be of rank axes rank when axes attributes is specified");
+      ORT_THROW("Resize requires 'sizes' input size to be of axes rank when axes attributes is specified");
     }
   }
 
   if (!scales.empty() && !sizes.empty() && scales.size() > static_cast<size_t>(input_tensor->Shape().GetDims().size())) {
-    throw std::invalid_argument("Resize requires only one of scales or sizes to be specified");
+    ORT_THROW("Resize requires only one of scales or sizes to be specified");
   }
 }
 
@@ -423,7 +421,7 @@ std::string ResizeProgram::CoordinateTransformModeToWGSL(CoordinateTransformMode
     case CoordinateTransformMode::HalfPixelSymmetric:
       return "half_pixel_symmetric";
     default:
-      throw std::invalid_argument("Unsupported CoordinateTransformMode enum");
+      ORT_THROW("Unsupported CoordinateTransformMode enum");
   }
 }
 
@@ -436,7 +434,7 @@ std::string ResizeProgram::KeepAspectRatioPolicyToWGSL(KeepAspectRatioPolicy pol
     case KeepAspectRatioPolicy::NotLarger:
       return "not_larger";
     default:
-      throw std::invalid_argument("Unsupported KeepAspectRatioPolicy enum");
+      ORT_THROW("Unsupported KeepAspectRatioPolicy enum");
   }
 }
 
@@ -449,7 +447,7 @@ std::string ResizeProgram::ModeToWGSL(Mode mode) {
     case Mode::Cubic:
       return "cubic";
     default:
-      throw std::invalid_argument("Unsupported Mode enum");
+      ORT_THROW("Unsupported Mode enum");
   }
 }
 
@@ -467,9 +465,9 @@ std::string ResizeProgram::NearestModeToWGSL(NearestMode mode, int opset_version
       if (opset_version < 11) {
         return "simple";
       }
-      throw std::invalid_argument("Nearest mode 'simple' not supported for opset >= 11");
+      ORT_THROW("Nearest mode 'simple' not supported for opset >= 11");
     default:
-      throw std::invalid_argument("Unsupported NearestMode enum");
+      ORT_THROW("Unsupported NearestMode enum");
   }
 }
 
@@ -480,7 +478,7 @@ Status ResizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
   const ShaderVariableHelper& output = shader.AddOutput("output", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias);
 
   // Initialize a string stream to build additional WGSL implementations
-  std::stringstream additional_impl;
+  OStringStream& additional_impl = shader.AdditionalImplementation();
 
   // Define getOriginalCoordinateFromResizedCoordinate function
   additional_impl << "fn getOriginalCoordinateFromResizedCoordinate(xResized: u32, xScale: f32, lengthResized: u32, "
@@ -792,9 +790,8 @@ Status ResizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
     std::tie(heightIdx, widthIdx) = is_2d ? std::make_tuple(0, 1) : is_nchw ? std::make_tuple(2, 3)
                                                                             : std::make_tuple(1, 2);
     // Define the lambda for creating cubic interpolation functions
-    auto createCubicInterpolationFunction = [&](int idx) -> std::string {
+    auto createCubicInterpolationFunction = [&](std::ostream& func, int idx) {
       std::string direction = (idx == heightIdx) ? "row" : "col";
-      std::ostringstream func;
 
       func << "fn " << direction << "CubicInterpolation(input_indices: input_indices_t, output_indices: output_indices_t) -> input_value_t {\n"
            << "  var output_index = " << output.IndicesGet("output_indices", idx) << ";\n"
@@ -829,12 +826,10 @@ Status ResizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
            << "  }\n"
            << "  return cubicInterpolation1D(data, coefs);\n"
            << "}\n\n";
-
-      return func.str();
     };
     // Append cubic interpolation functions for height and width indices
-    additional_impl << createCubicInterpolationFunction(heightIdx);
-    additional_impl << createCubicInterpolationFunction(widthIdx);
+    createCubicInterpolationFunction(additional_impl, heightIdx);
+    createCubicInterpolationFunction(additional_impl, widthIdx);
     // Define getCubicInterpolationCoefs function
     additional_impl << "fn getCubicInterpolationCoefs(s: input_value_t) -> array<input_value_t, 4> {\n"
                     << "  var absS = abs(s);\n"
@@ -870,11 +865,8 @@ Status ResizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
     return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Unsupported interpolation mode.");
   }
 
-  // Inject the additional implementations into the shader
-  shader.AdditionalImplementation() << additional_impl.str();
-
   // Start building the main shader function body
-  std::stringstream main_body;
+  OStringStream& main_body = shader.MainFunctionBody();
 
   // Inject guard against out-of-bounds workgroup sizes
   main_body << shader.GuardAgainstOutOfBoundsWorkgroupSizes("uniforms.output_size") << "\n";
@@ -908,8 +900,6 @@ Status ResizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
     }
   }
 
-  // Inject the main function body
-  shader.MainFunctionBody() << main_body.str();
   return Status::OK();
 }
 

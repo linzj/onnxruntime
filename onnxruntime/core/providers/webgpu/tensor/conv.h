@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/providers/webgpu/string_utils.h"
 #include "core/providers/webgpu/webgpu_kernel.h"
 #include "core/providers/webgpu/program.h"
 #include <vector>
@@ -180,7 +181,7 @@ class MatmulProgram : public Program<MatmulProgram> {
       {"beta", ProgramUniformVariableDataType::Float32});
 
  private:
-  std::string GenerateMatMulReadWriteFnSource(const std::vector<const ShaderVariableHelper*>& variables) const;
+  Printable GenerateMatMulReadWriteFnSource(const std::vector<const ShaderVariableHelper*>& variables) const;
 };
 
 class Conv2DMatMulProgram : public Program<Conv2DMatMulProgram> {
@@ -221,16 +222,16 @@ class Conv2DMatMulProgram : public Program<Conv2DMatMulProgram> {
       {"beta", ProgramUniformVariableDataType::Float32});
 
  private:
-  std::string GenerateConv2DCommonSnippet(bool is_channels_last,
-                                          bool fit_a_outer,
-                                          bool fit_b_outer,
-                                          bool fit_inner,
-                                          bool add_bias,
-                                          const InternalActivationAttributes&,
-                                          const std::string& data_type,
-                                          uint32_t inner_element_size_x,
-                                          uint32_t inner_element_size_w,
-                                          uint32_t inner_element_size) const;
+  Printable GenerateConv2DCommonSnippet(bool is_channels_last,
+                                        bool fit_a_outer,
+                                        bool fit_b_outer,
+                                        bool fit_inner,
+                                        bool add_bias,
+                                        const InternalActivationAttributes&,
+                                        const std::string& data_type,
+                                        uint32_t inner_element_size_x,
+                                        uint32_t inner_element_size_w,
+                                        uint32_t inner_element_size) const;
 
   std::string GetXSnippet(uint32_t inner_element_size, const std::string& data_type) const;
   std::string GetWSnippet(uint32_t inner_element_size) const;
