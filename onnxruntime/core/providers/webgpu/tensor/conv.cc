@@ -83,7 +83,7 @@ ConvAttributes ParseConvAttributes(const OpKernelInfo& info) {
   convAttrs.auto_pad = static_cast<AutoPadKind>(static_cast<uint8_t>(info.GetAttrOrDefault<float>("auto_pad", 0.0f)));
 
   // Parse dilations
-  gsl::span<const uint32_t> dilations_span;
+  gsl::span<const int64_t> dilations_span;
   if (info.GetAttrsAsSpan("dilations", dilations_span).IsOK()) {
     convAttrs.dilations = std::vector<uint32_t>(dilations_span.begin(), dilations_span.end());
   }
@@ -1457,6 +1457,8 @@ int64_t Conv::AdjustPadAndReturnShape(
     return (input_size + pads[pad_begin_index] + pads[pad_end_index] - dkernel) / stride + 1;
   }
 }
+
+GroupedConvVectorizeProgram::GroupedConvVectorizeProgram() : Program("GroupedConvVectorize") {}
 
 Status GroupedConvVectorizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
   // Declare input and output variables with appropriate usage flags
