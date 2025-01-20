@@ -46,7 +46,9 @@ Status ParseInternalActivationAttributes(const OpKernelInfo& info, InternalActiv
   constexpr const float kMAX_CLIP = 3.4028234663852886e38;
 
   status = info.GetAttr<std::string>("activation", &activation_str);
-  ORT_RETURN_IF_ERROR(status);
+  if (!status.IsOK()) {
+    return Status();
+  }
 
   std::vector<float> activation_params;
   if (activation_str == "Relu") {

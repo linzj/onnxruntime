@@ -24,27 +24,33 @@ struct hash<std::vector<T>> {
 namespace onnxruntime {
 namespace webgpu {
 
-#define WEBGPU_RESIZE_VERSIONED_KERNEL(start, end)             \
-  ONNX_OPERATOR_VERSIONED_KERNEL_EX(                           \
-      Resize,                                                  \
-      kOnnxDomain,                                             \
-      start,                                                   \
-      end,                                                     \
-      kWebGpuExecutionProvider,                                \
-      (*KernelDefBuilder::Create())                            \
-          .TypeConstraint("T1", WebGpuSupportedNumberTypes())  \
-          .TypeConstraint("T2", WebGpuSupportedNumberTypes()), \
+#define WEBGPU_RESIZE_VERSIONED_KERNEL(start, end)            \
+  ONNX_OPERATOR_VERSIONED_KERNEL_EX(                          \
+      Resize,                                                 \
+      kOnnxDomain,                                            \
+      start,                                                  \
+      end,                                                    \
+      kWebGpuExecutionProvider,                               \
+      (*KernelDefBuilder::Create())                           \
+          .TypeConstraint("T1", WebGpuSupportedNumberTypes()) \
+          .TypeConstraint("T2", WebGpuSupportedNumberTypes()) \
+          .InputMemoryType(OrtMemTypeCPU, 1)                  \
+          .InputMemoryType(OrtMemTypeCPU, 2)                  \
+          .InputMemoryType(OrtMemTypeCPU, 3),                 \
       Resize);
 
-#define WEBGPU_RESIZE_KERNEL(version)                          \
-  ONNX_OPERATOR_KERNEL_EX(                                     \
-      Resize,                                                  \
-      kOnnxDomain,                                             \
-      version,                                                 \
-      kWebGpuExecutionProvider,                                \
-      (*KernelDefBuilder::Create())                            \
-          .TypeConstraint("T1", WebGpuSupportedNumberTypes())  \
-          .TypeConstraint("T2", WebGpuSupportedNumberTypes()), \
+#define WEBGPU_RESIZE_KERNEL(version)                         \
+  ONNX_OPERATOR_KERNEL_EX(                                    \
+      Resize,                                                 \
+      kOnnxDomain,                                            \
+      version,                                                \
+      kWebGpuExecutionProvider,                               \
+      (*KernelDefBuilder::Create())                           \
+          .TypeConstraint("T1", WebGpuSupportedNumberTypes()) \
+          .TypeConstraint("T2", WebGpuSupportedNumberTypes()) \
+          .InputMemoryType(OrtMemTypeCPU, 1)                  \
+          .InputMemoryType(OrtMemTypeCPU, 2)                  \
+          .InputMemoryType(OrtMemTypeCPU, 3),                 \
       Resize);
 
 WEBGPU_RESIZE_VERSIONED_KERNEL(10, 10)
@@ -143,25 +149,25 @@ ResizeAttributes ParseResizeAttributes(const OpKernelInfo& info) {
   attrs.axes = info.GetAttrsOrDefault("axes");
 
   // Parse coordinateTransformMode
-  attrs.coordinateTransformMode = ParseCoordinateTransformMode(info.GetAttrOrDefault<std::string>("coordinateTransformMode", "half_pixel"));
+  attrs.coordinateTransformMode = ParseCoordinateTransformMode(info.GetAttrOrDefault<std::string>("coordinate_transformation_mode", "half_pixel"));
 
   // Parse cubicCoeffA
-  attrs.cubicCoeffA = info.GetAttrOrDefault<float>("cubicCoeffA", -0.75f);
+  attrs.cubicCoeffA = info.GetAttrOrDefault<float>("cubic_coeff_a", -0.75f);
 
   // Parse excludeOutside
-  attrs.excludeOutside = info.GetAttrOrDefault("excludeOutside", 0.0f) != 0.0f;
+  attrs.excludeOutside = info.GetAttrOrDefault("exclude_outside", 0.0f) != 0.0f;
 
   // Parse extrapolationValue
-  attrs.extrapolationValue = info.GetAttrOrDefault<float>("extrapolationValue", 0.0f);
+  attrs.extrapolationValue = info.GetAttrOrDefault<float>("extrapolation_value", 0.0f);
 
   // Parse keepAspectRatioPolicy
-  attrs.keepAspectRatioPolicy = ParseKeepAspectRatioPolicy(info.GetAttrOrDefault<std::string>("keepAspectRatioPolicy", "stretch"));
+  attrs.keepAspectRatioPolicy = ParseKeepAspectRatioPolicy(info.GetAttrOrDefault<std::string>("keep_aspect_ratio_policy", "stretch"));
 
   // Parse mode
   attrs.mode = ParseMode(info.GetAttrOrDefault<std::string>("mode", "nearest"));
 
   // Parse nearestMode
-  attrs.nearestMode = ParseNearestMode(info.GetAttrOrDefault<std::string>("nearestMode", "simple"));
+  attrs.nearestMode = ParseNearestMode(info.GetAttrOrDefault<std::string>("nearest_mode", "simple"));
 
   return attrs;
 }
@@ -320,29 +326,29 @@ void Resize::ValidateScales(const std::vector<float>& scales, const ResizeAttrib
 // Helper function to validate inputs
 void Resize::ValidateInputs(const ComputeContext& context,
                             const ResizeAttributes& attributes,
-                            int opsetVersion,
+                            int opset_version,
                             std::vector<float>& scales,
                             std::vector<int64_t>& sizes,
                             std::vector<float>& roi) const {
   // Determine input indices based on opsetVersion
-  int roiInputIndex, scalesInputIndex, sizesInputIndex;
-  if (opsetVersion > 10) {
-    roiInputIndex = 1;
-    scalesInputIndex = 2;
-    sizesInputIndex = 3;
+  int roi_input_index, scales_input_index, size_input_index;
+  if (opset_version > 10) {
+    roi_input_index = 1;
+    scales_input_index = 2;
+    size_input_index = 3;
   } else {
-    roiInputIndex = -1;
-    scalesInputIndex = (context.InputCount() > 1) ? 1 : -1;
-    sizesInputIndex = -1;
+    roi_input_index = -1;
+    scales_input_index = (context.InputCount() > 1) ? 1 : -1;
+    size_input_index = -1;
   }
 
   const auto input_tensor = context.Input(0);
   int rank = static_cast<int>(input_tensor->Shape().GetDims().size());
 
   // Handle roi input
-  if (roiInputIndex >= 0 && static_cast<size_t>(context.InputCount()) > static_cast<size_t>(roiInputIndex) &&
-      context.Input(roiInputIndex)->Shape().GetDims().size() > 0) {
-    const auto& roi_tensor = context.Input(roiInputIndex);
+  if (roi_input_index >= 0 && static_cast<size_t>(context.InputCount()) > static_cast<size_t>(roi_input_index) &&
+      context.Input(roi_input_index)->Shape().GetDims().size() > 0) {
+    const auto& roi_tensor = context.Input(roi_input_index);
     auto roi_data = roi_tensor->Data<float>();
     size_t roi_size = roi_tensor->Shape().Size();
     roi.assign(roi_data, roi_data + roi_size);
@@ -351,17 +357,17 @@ void Resize::ValidateInputs(const ComputeContext& context,
   }
 
   // Handle scales input
-  if (scalesInputIndex >= 0 && static_cast<size_t>(context.InputCount()) > static_cast<size_t>(scalesInputIndex) &&
-      context.Input(scalesInputIndex)->Shape().GetDims().size() == 1 &&
-      context.Input(scalesInputIndex)->Shape().GetDims()[0] > 0) {
-    const auto& scales_tensor = context.Input(scalesInputIndex);
+  if (scales_input_index >= 0 && static_cast<size_t>(context.InputCount()) > static_cast<size_t>(scales_input_index) &&
+      context.Input(scales_input_index)->Shape().GetDims().size() == 1 &&
+      context.Input(scales_input_index)->Shape().GetDims()[0] > 0) {
+    const auto& scales_tensor = context.Input(scales_input_index);
     const float* scales_data = scales_tensor->Data<float>();
     size_t scales_size = scales_tensor->Shape().Size();
     scales.assign(scales_data, scales_data + scales_size);
 
     if (!scales.empty() &&
         scales.size() != static_cast<size_t>(rank) &&
-        opsetVersion >= 18 &&
+        opset_version >= 18 &&
         scales.size() != attributes.axes.size()) {
       ORT_THROW("Resize requires scales input size to be same as input rank or axes size for opset 18 and up");
     }
@@ -374,17 +380,17 @@ void Resize::ValidateInputs(const ComputeContext& context,
   }
 
   // Handle sizes input
-  if (sizesInputIndex >= 0 && static_cast<size_t>(context.InputCount()) > static_cast<size_t>(sizesInputIndex) &&
-      context.Input(sizesInputIndex)->Shape().GetDims().size() == 1 &&
-      context.Input(sizesInputIndex)->Shape().GetDims()[0] > 0) {
-    const auto& sizes_tensor = context.Input(sizesInputIndex);
+  if (size_input_index >= 0 && static_cast<size_t>(context.InputCount()) > static_cast<size_t>(size_input_index) &&
+      context.Input(size_input_index)->Shape().GetDims().size() == 1 &&
+      context.Input(size_input_index)->Shape().GetDims()[0] > 0) {
+    const auto& sizes_tensor = context.Input(size_input_index);
     const int64_t* sizes_data = sizes_tensor->Data<int64_t>();
     size_t sizes_size = sizes_tensor->Shape().Size();
     sizes.assign(sizes_data, sizes_data + sizes_size);
 
     if (!sizes.empty() &&
         sizes.size() != static_cast<size_t>(rank) &&
-        opsetVersion >= 18 &&
+        opset_version >= 18 &&
         sizes.size() != attributes.axes.size()) {
       ORT_THROW("Resize requires sizes input size to be same as input rank or axes size for opset 18 and up");
     }
@@ -937,8 +943,7 @@ Status Resize::ComputeInternal(ComputeContext& context) const {
     roi = UpdateRoI(attributes_.roi, attributes_.axes, input_dims.size());
 
     // Initialize the output shape using the initOutputShape lambda
-    output_shape = InitOutputShape(input_dims, attributes_.scales, sizes, attributes_.axes);
-    scales = attributes_.scales;
+    output_shape = InitOutputShape(input_dims, scales, sizes, attributes_.axes);
 
     if (attributes_.scales.empty()) {
       // Calculate scales if not provided
@@ -969,7 +974,7 @@ Status Resize::ComputeInternal(ComputeContext& context) const {
   // Initialize ResizeProgram
   ResizeProgram program;
   program.attributes_ = attributes_;
-  program.attributes_.output_shape = output_tensor->Shape();
+  program.attributes_.output_shape = output_shape;
   program.attributes_.input_shape = input_tensor->Shape();
   program.attributes_.scales = scales;
   program.attributes_.roi = roi;
