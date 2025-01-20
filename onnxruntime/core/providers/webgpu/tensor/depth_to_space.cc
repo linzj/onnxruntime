@@ -39,8 +39,7 @@ DepthToSpace::DepthToSpace(const OpKernelInfo& info) : WebGpuKernel(info) {
 #endif
 
   // Get format attribute (default to NCHW)
-  std::string format;
-  ORT_THROW_IF_ERROR(info.GetAttr("format", &format));
+  std::string format = info.GetAttrOrDefault("format", std::string("NCHW"));
   attributes_.nchw = (format == "NCHW");
 }
 
