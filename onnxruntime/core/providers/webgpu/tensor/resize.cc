@@ -483,7 +483,7 @@ std::string ResizeProgram::NearestModeToWGSL(NearestMode mode, int opset_version
 Status ResizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
   // Declare input and output variables using ShaderVariableHelper with appropriate usage flags
   const ShaderVariableHelper& input = shader.AddInput("input", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias);
-  const ShaderVariableHelper& output = shader.AddOutput("output", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias);
+  const ShaderVariableHelper& output = shader.AddOutput("output", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias);
 
   // Initialize a string stream to build additional WGSL implementations
   OStringStream& additional_impl = shader.AdditionalImplementation();
@@ -586,7 +586,7 @@ Status ResizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
                   << output_shape_length << "> {\n"
                   << "  var original_indices: array<output_value_t, " << output_shape_length << ">;\n"
                   << "  for (var i: u32 = 0u; i < " << output_shape_length << "u; i = i + 1u) {\n"
-                  << "    let output_index = " << output.GetByIndices("i") << ";\n"
+                  << "    let output_index = " << output.IndicesGet("output_indices", "i") << ";\n"
                   << "    let scale = " << GetElementAt("uniforms.scales", "i", attributes_.scales.size(), is_f16) << ";\n"
                   << "    let roi_low = " << GetElementAt("uniforms.roi", "i", attributes_.roi.size(), is_f16) << ";\n"
                   << "    let roi_hi = " << GetElementAt("uniforms.roi", "i + " + std::to_string(input_shape_length), attributes_.roi.max_size(), is_f16) << ";\n"
@@ -606,10 +606,8 @@ Status ResizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
   additional_impl << "fn calculateInputIndicesFromOutputIndices(output_indices: output_indices_t) -> input_indices_t {\n"
                   << "  var input_indices: input_indices_t;\n"
                   << "  for (var i: u32 = 0u; i < " << output_shape_length << "; i++) {\n"
-                  << "    var output_index = ${output.indicesGet('output_indices', 'i')};"
                   << "    var output_index = " << output.IndicesGet("output_indices", "i") << ";\n"
                   << "    var input_index: u32;\n"
-                  << "    var scale = ${getElementAt('uniforms.scales', 'i', scalesLength)};" << ";\n"
                   << "    var scale = " << GetElementAt("uniforms.scales", "i", attributes_.scales.size()) << ";\n"
                   << "    if (scale == 1.0) {" << "\n"
                   << "      input_index = output_index;\n"
@@ -620,7 +618,7 @@ Status ResizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
                   << "      var output_shape_i = " << GetElementAt("uniforms.output_shape", "i", output_shape_length) << ";\n"
                   << "      var original_idx = getOriginalCoordinateFromResizedCoordinate(output_index, scale, output_shape_i," << "\n"
                   << "                                                                    input_shape_i, roi_low, roi_hi);\n"
-                  << "      if (!" << use_extrapolation << " || (original_idx >= 0 && original_idx < output_value_t(input_shape_i))) {\n"
+                  << "      if (!" << (use_extrapolation ? "true" : "false") << " || (original_idx >= 0 && original_idx < output_value_t(input_shape_i))) {\n"
                   << "        if (original_idx < 0) {\n"
                   << "          input_index = 0;\n"
                   << "        } else if (original_idx > output_value_t(input_shape_i - 1)) {\n"
@@ -640,9 +638,7 @@ Status ResizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
   // Define checkInputIndices function
   additional_impl << "fn checkInputIndices(input_indices: input_indices_t) -> bool {\n"
                   << "  for (var i: u32 = 0u; i < " << output_shape_length << "u; i = i + 1u) {\n"
-                  << "  var input_index = ${input.indicesGet('input_indices', 'i')};\n"
                   << "  var input_index = " << input.IndicesGet("input_indices", "i") << ";\n"
-                  << "  if (input_index < 0 || input_index >= ${getElementAt('uniforms.input_shape', 'i', inputShape.length)}) {\n"
                   << "  if (input_index < 0 || input_index >= " << GetElementAt("uniforms.input_shape", "i", input_shape_length) << ") {\n"
                   << "    return false;\n"
                   << "  }\n"
@@ -661,10 +657,8 @@ Status ResizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
       additional_impl
           << "    fn getInputValue(batch: u32, channel: u32, row: u32, col: u32) -> input_value_t {\n"
           << "      var input_indices: input_indices_t;\n"
-          << "      ${input.indicesSet('input_indices', heightIdx, `max(0, min(row, ${inputShape[heightIdx]} - 1))`)};\n"
-          << "      " << input.IndicesSet("input_indices", heightIdx, MakeString("max(0, min(row, ", attributes_.input_shape[heightIdx] - 1)) << ";\n"
-          << "      ${input.indicesSet('input_indices', widthIdx, `max(0, min(col, ${inputShape[widthIdx]} - 1))`)};\n"
-          << "      " << input.IndicesSet("input_indices", widthIdx, MakeString("max(0, min(col, ", attributes_.input_shape[widthIdx] - 1)) << ";\n"
+          << "      " << input.IndicesSet("input_indices", heightIdx, MakeString("max(0, min(row, ", attributes_.input_shape[heightIdx] - 1, "))")) << "\n"
+          << "      " << input.IndicesSet("input_indices", widthIdx, MakeString("max(0, min(col, ", attributes_.input_shape[widthIdx] - 1, "))")) << "\n"
           << "      " << SetChannelAndBatchIndices(input, channelIdx, batchIdx, 2) << "\n"
           << "      return " << input.GetByIndices("input_indices") << ";\n"
           << "    }\n"
@@ -687,7 +681,6 @@ Status ResizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
                       << "      var row2: u32 = u32(row + 1);\n"
                       << "      var col2: u32 = u32(col + 1);\n"
                       << "      var channel: u32 = " << (input_shape_length > 2 ? MakeString("u32(originalIndices[", channelIdx, "])") : "0") << ";\n"
-                      << "      var channel: u32 = ;\n"
                       << "      var batch: u32 =  " << (input_shape_length > 2 ? MakeString("u32(originalIndices[", batchIdx, "])") : "0") << ";\n"
                       << "      var x11: input_value_t = getInputValue(batch, channel, row1, col1);\n"
                       << "      var x12: input_value_t = getInputValue(batch, channel, row1, col2);\n"
@@ -716,10 +709,9 @@ Status ResizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
       additional_impl
           << "    fn getInputValue(batch: u32, channel: u32, depth:u32, height: u32, width: u32) -> input_value_t {\n"
           << "      var input_indices: input_indices_t;\n"
-          << "      " << input.IndicesSet("input_indices", depthIdx, MakeString("max(0, min(depth, ", attributes_.input_shape[depthIdx] - 1)) << ";\n"
+          << "      " << input.IndicesSet("input_indices", depthIdx, MakeString("max(0, min(depth, ", attributes_.input_shape[depthIdx] - 1, "))")) << "\n"
           << "      " << input.IndicesSet("input_indices", heightIdx, MakeString("")) << ";\n"
-          << "      " << input.IndicesSet("input_indices", widthIdx, MakeString("max(0, min(width, ", attributes_.input_shape[widthIdx] - 1)) << ";\n"
-          << "      ${setChannelAndBatchIndices(input, channelIdx, batchIdx, 3)}\n"
+          << "      " << input.IndicesSet("input_indices", widthIdx, MakeString("max(0, min(width, ", attributes_.input_shape[widthIdx] - 1, "))")) << "\n"
           << "      " << SetChannelAndBatchIndices(input, channelIdx, batchIdx, 3) << "\n"
           << "      return " << input.GetByIndices("input_indices") << ";\n"
           << "    }\n"
@@ -727,7 +719,6 @@ Status ResizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
           << "    fn trilinearInterpolation(output_indices: output_indices_t) -> input_value_t {\n"
           << "      var originalIndices = calculateOriginalIndicesFromOutputIndices(output_indices);\n"
           << "      var depth:input_value_t = originalIndices[" << depthIdx << "];\n"
-          << "      var height:input_value_t = originalIndices[${heightIdx}];\n"
           << "      var height:input_value_t = originalIndices[" << heightIdx << "];\n"
           << "      var width:input_value_t = originalIndices[" << widthIdx << "];\n";
       if (use_extrapolation) {
@@ -880,29 +871,29 @@ Status ResizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
   main_body << shader.GuardAgainstOutOfBoundsWorkgroupSizes("uniforms.output_size") << "\n";
 
   // Determine if scaling is required
-  bool noScale = attributes_.input_shape == attributes_.output_shape;
+  bool no_scale = attributes_.input_shape == attributes_.output_shape;
 
-  if (noScale) {
+  if (no_scale) {
     // No scaling; direct copy
-    main_body << output.SetByIndices("global_idx", input.GetByIndices("global_idx")) << ";\n";
+    main_body << "output[global_idx] = input[global_idx];\n";
   } else {
     // Scaling required
     main_body << "  let output_indices = " << output.OffsetToIndices("global_idx") << ";\n"
-              << "  var input_indices: input_indices_type;\n";
+              << "  var input_indices: input_indices_t;\n";
 
     if (attributes_.mode == Mode::Nearest) {
       main_body << "input_indices = calculateInputIndicesFromOutputIndices(output_indices);\n"
                 << "  if (checkInputIndices(input_indices)) {\n"
-                << "    " << output.SetByIndices("global_idx", input.GetByIndices("input_indices")) << ";\n"
+                << "    output[global_idx] = " << input.GetByIndices("input_indices") << ";\n"
                 << "  } else {\n"
-                << "    " << output.SetByIndices("global_idx", std::to_string(attributes_.extrapolationValue)) << ";\n"
+                << "    output[global_idx] = " << attributes_.extrapolationValue << ";\n"
                 << "  }\n";
     } else if (attributes_.mode == Mode::Linear) {
       // Bilinear interpolation
       std::string selected_function = (input_shape_length == 2 || input_shape_length == 4 ? "bilinearInterpolation" : "trilinearInterpolation");
-      main_body << "  " << output.SetByIndices("global_idx", selected_function + "(output_indices)") << ";\n";
+      main_body << "  output[global_idx] = " << selected_function << "(output_indices);\n";
     } else if (attributes_.mode == Mode::Cubic) {
-      main_body << "  " << output.SetByIndices("global_idx", "bicubicInterpolation(output_indices)") << ";\n";
+      main_body << "  output[global_idx] = bicubicInterpolation(output_indices);\n";
     } else {
       return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Unsupported resize mode.");
     }
