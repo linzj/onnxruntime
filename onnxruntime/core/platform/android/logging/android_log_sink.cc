@@ -12,7 +12,7 @@ namespace onnxruntime {
 namespace logging {
 
 void AndroidLogSink::SendImpl(const Timestamp& /* timestamp */, const std::string& logger_id, const Capture& message) {
-  std::ostringstream msg;
+  std::stringstream msg;
 
   int severity = ANDROID_LOG_INFO;
   switch (message.Severity()) {
@@ -36,7 +36,13 @@ void AndroidLogSink::SendImpl(const Timestamp& /* timestamp */, const std::strin
   msg << " [" << message.SeverityPrefix() << ":" << message.Category() << ":" << logger_id << ", "
       << message.Location().ToString() << "] " << message.Message() << std::endl;
 
-  __android_log_print(severity, message.Category(), "%s", msg.str().c_str());
+  // Reset read position
+  msg.seekg(0, std::ios::beg);
+
+  std::string line;
+  while (std::getline(msg, line)) {
+    __android_log_print(severity, message.Category(), "%s", line.c_str());
+  }
 }
 
 }  // namespace logging
