@@ -37,7 +37,7 @@ struct InternalActivationAttributes {
 // Struct to hold convolution attributes
 struct ConvAttributes : InternalActivationAttributes {
   AutoPadKind auto_pad;
-  std::vector<uint32_t> dilations;
+  std::vector<int32_t> dilations;
   bool nchw;  // NHWC or NCHW
   int64_t group;
   TensorShapeVector kernel_shape;
@@ -181,7 +181,7 @@ class MatmulProgram : public Program<MatmulProgram> {
       {"beta", ProgramUniformVariableDataType::Float32});
 
  private:
-  Printable GenerateMatMulReadWriteFnSource(const std::vector<const ShaderVariableHelper*>& variables) const;
+  std::string GenerateMatMulReadWriteFnSource(const std::vector<const ShaderVariableHelper*>& variables) const;
 };
 
 class Conv2DMatMulProgram : public Program<Conv2DMatMulProgram> {
@@ -222,16 +222,16 @@ class Conv2DMatMulProgram : public Program<Conv2DMatMulProgram> {
       {"beta", ProgramUniformVariableDataType::Float32});
 
  private:
-  Printable GenerateConv2DCommonSnippet(bool is_channels_last,
-                                        bool fit_a_outer,
-                                        bool fit_b_outer,
-                                        bool fit_inner,
-                                        bool add_bias,
-                                        const InternalActivationAttributes&,
-                                        const std::string& data_type,
-                                        uint32_t inner_element_size_x,
-                                        uint32_t inner_element_size_w,
-                                        uint32_t inner_element_size) const;
+  std::string GenerateConv2DCommonSnippet(bool is_channels_last,
+                                          bool fit_a_outer,
+                                          bool fit_b_outer,
+                                          bool fit_inner,
+                                          bool add_bias,
+                                          const InternalActivationAttributes&,
+                                          const std::string& data_type,
+                                          uint32_t inner_element_size_x,
+                                          uint32_t inner_element_size_w,
+                                          uint32_t inner_element_size) const;
 
   std::string GetXSnippet(uint32_t inner_element_size, const std::string& data_type) const;
   std::string GetWSnippet(uint32_t inner_element_size) const;

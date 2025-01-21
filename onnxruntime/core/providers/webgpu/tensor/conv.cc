@@ -87,7 +87,7 @@ ConvAttributes ParseConvAttributes(const OpKernelInfo& info) {
   // Parse dilations
   gsl::span<const int64_t> dilations_span;
   if (info.GetAttrsAsSpan("dilations", dilations_span).IsOK()) {
-    convAttrs.dilations = std::vector<uint32_t>(dilations_span.begin(), dilations_span.end());
+    convAttrs.dilations = std::vector<int32_t>(dilations_span.begin(), dilations_span.end());
   }
 
   // Parse kernel_shape
@@ -159,25 +159,25 @@ bool AreEqual(const TensorShapeVector& arr1, const std::vector<int>& arr2) {
 #endif
 
 // Helper function to convert output batch indices to input batch indices
-Printable ConvertOutputBatchIndicesToInputBatchIndices(
+std::string ConvertOutputBatchIndicesToInputBatchIndices(
     const std::string& target_indices_name,
     const ShaderVariableHelper& input_var,
     size_t input_batch_rank,
     size_t output_batch_rank,
     const std::string& batch_indices_name) {
-  return Printable([&](std::ostream& code) {
-    // Assume output_batch_rank >= input_batch_rank, the first output_batch_rank - input_batch_rank of
-    // output_batch_rank should be ignored
-    const size_t extending_input_rank = output_batch_rank - input_batch_rank;
+  std::ostringstream code;
+  // Assume output_batch_rank >= input_batch_rank, the first output_batch_rank - input_batch_rank of
+  // output_batch_rank should be ignored
+  const size_t extending_input_rank = output_batch_rank - input_batch_rank;
 
-    for (size_t i = 0; i < input_batch_rank; ++i) {
-      code << "if (" << GetElementAt(input_var.Shape(), i, input_var.Rank()) << " != 1) {\n"
-           << "  " << input_var.IndicesSet(target_indices_name, i, GetElementAt(batch_indices_name, i + extending_input_rank, output_batch_rank)) << "\n"
-           << "} else {\n"
-           << "  " << input_var.IndicesSet(target_indices_name, i, "0") << "\n"
-           << "}\n";
-    }
-  });
+  for (size_t i = 0; i < input_batch_rank; ++i) {
+    code << "if (" << GetElementAt(input_var.Shape(), i, input_var.Rank()) << " != 1) {\n"
+         << "  " << input_var.IndicesSet(target_indices_name, i, GetElementAt(batch_indices_name, i + extending_input_rank, output_batch_rank)) << "\n"
+         << "} else {\n"
+         << "  " << input_var.IndicesSet(target_indices_name, i, "0") << "\n"
+         << "}\n";
+  }
+  return code.str();
 }
 
 // Helper function to squeeze shape
@@ -307,14 +307,14 @@ Status RunGroupedConvVectorizeProgram(
       static_cast<int32_t>(attributes.pads[1])};
 
   // Configure inputs/outputs
-  program->AddInputs({{inputs[0], ProgramTensorMetadataDependency::TypeAndShape}});
+  program->AddInputs({{inputs[0], ProgramTensorMetadataDependency::TypeAndRank}});
   program->AddInputs({{inputs[1], ProgramTensorMetadataDependency::None}});
   if (has_bias) {
     program->AddInputs({{inputs[2], ProgramTensorMetadataDependency::None}});
   }
 
   output_tensor = context.Output(0, TensorShape(output_shape));
-  program->AddOutput({output_tensor, ProgramTensorMetadataDependency::TypeAndShape});
+  program->AddOutput({output_tensor, ProgramTensorMetadataDependency::TypeAndRank});
 
   // Set dispatch sizes
   program->SetDispatchGroupSize((static_cast<uint32_t>(output_size) + 63) / 64);
@@ -383,8 +383,8 @@ Status RunGroupedConvProgram(
   // Configure program inputs/outputs
   output_tensor = context.Output(0, TensorShape(output_shape));
 
-  program->AddInputs({{x, ProgramTensorMetadataDependency::TypeAndShape}});
-  program->AddInputs({{w, ProgramTensorMetadataDependency::TypeAndShape}});
+  program->AddInputs({{x, ProgramTensorMetadataDependency::TypeAndRank}});
+  program->AddInputs({{w, ProgramTensorMetadataDependency::TypeAndRank}});
   if (has_bias) {
     program->AddInputs({{b, ProgramTensorMetadataDependency::None}});
   }
@@ -567,8 +567,8 @@ Status RunMatmulProgram(
   program->attributes_.b_shape = to_uint32_vector(b_shape);
 
   // Configure program inputs/outputs
-  program->AddInputs({{A, ProgramTensorMetadataDependency::TypeAndShape, a_shape_tensor, static_cast<int>(components)}});
-  program->AddInputs({{B, ProgramTensorMetadataDependency::TypeAndShape, b_shape_tensor, static_cast<int>(components)}});
+  program->AddInputs({{A, ProgramTensorMetadataDependency::TypeAndRank, a_shape_tensor, static_cast<int>(components)}});
+  program->AddInputs({{B, ProgramTensorMetadataDependency::TypeAndRank, b_shape_tensor, static_cast<int>(components)}});
   if (bias) {
     const auto biasComponents = is_channels_last ? components : 1;
     program->AddInputs({{bias, ProgramTensorMetadataDependency::TypeAndRank, input_shapes[2].GetDims(), static_cast<int>(biasComponents)}});
@@ -576,7 +576,7 @@ Status RunMatmulProgram(
   // allocate a Tensor object for outerDims
   std::vector<int64_t> outer_dims_int64(outer_dims.begin(), outer_dims.end());
   auto outer_dims_tensor = context.CreateGPUTensor(A->DataType(), TensorShape(outer_dims_int64));
-  program->AddInputs({{&outer_dims_tensor, ProgramTensorMetadataDependency::TypeAndShape, 1}});
+  program->AddInputs({{&outer_dims_tensor, ProgramTensorMetadataDependency::TypeAndRank, 1}});
 
   program->AddOutput({context.Output(0, output_shape_tensor), ProgramTensorMetadataDependency::None, output_shape_tensor, static_cast<int>(components)});
 
@@ -681,10 +681,10 @@ Status RunConv2DMatMulProgram(
   program->attributes_.dim_inner = static_cast<uint32_t>(dim_inner);      // Set dim_inner
 
   // Configure inputs/outputs
-  program->AddInputs({{inputs[0], ProgramTensorMetadataDependency::TypeAndShape}});
-  program->AddInputs({{inputs[1], ProgramTensorMetadataDependency::TypeAndShape}});
+  program->AddInputs({{inputs[0], ProgramTensorMetadataDependency::TypeAndRank}});
+  program->AddInputs({{inputs[1], ProgramTensorMetadataDependency::TypeAndRank}});
   if (has_bias) {
-    program->AddInputs({{inputs[2], ProgramTensorMetadataDependency::TypeAndShape}});
+    program->AddInputs({{inputs[2], ProgramTensorMetadataDependency::TypeAndRank}});
   }
   program->AddOutput({output_tensor, ProgramTensorMetadataDependency::None});
 
@@ -697,8 +697,8 @@ Status RunConv2DMatMulProgram(
                                 {static_cast<int32_t>(dim_b_outer)},
                                 {static_cast<int32_t>(dim_inner)},
                                 {std::vector<int32_t>{static_cast<int32_t>(attributes.pads[0]), static_cast<int32_t>(attributes.pads[1])}},
-                                {std::vector<uint32_t>{static_cast<uint32_t>(attributes.strides[0]),
-                                                       static_cast<uint32_t>(attributes.strides[1])}},
+                                {std::vector<int32_t>{static_cast<int32_t>(attributes.strides[0]),
+                                                      static_cast<int32_t>(attributes.strides[1])}},
                                 {attributes.dilations},
                                 {attributes.clipMax.has_value() ? attributes.clipMax.value() : 3.4028234663852886e38f},
                                 {attributes.clipMin.has_value() ? attributes.clipMin.value() : -3.4028234663852886e38f},
@@ -753,92 +753,92 @@ std::string GetActivationSnippet(
 }
 
 // Helper functions moved from MatmulProgram class to anonymous namespace
-Printable WriteDataToSubAVec4SnippetImpl(bool transpose_a, const ShaderIndicesHelper* batch_dims) {
-  return Printable([&](std::ostream& code) {
-    if (transpose_a) {
-      code << "mm_Asub[inputRow][inputCol] = mm_readA(batch, kStart + inputRow, "
-           << "globalRowStart / innerElementSize + inputCol" << ((batch_dims && batch_dims->Rank() > 0) ? ", batchIndices" : "") << ");";
-    } else {
-      code << "mm_Asub[inputRow][inputCol] = mm_readA(batch, globalRowStart + inputRow, "
-           << "kStart / innerElementSize + inputCol" << ((batch_dims && batch_dims->Rank() > 0) ? ", batchIndices" : "") << ");";
-    }
-  });
+std::string WriteDataToSubAVec4SnippetImpl(bool transpose_a, const ShaderIndicesHelper* batch_dims) {
+  std::ostringstream code;
+  if (transpose_a) {
+    code << "mm_Asub[inputRow][inputCol] = mm_readA(batch, kStart + inputRow, "
+         << "globalRowStart / innerElementSize + inputCol" << ((batch_dims && batch_dims->Rank() > 0) ? ", batchIndices" : "") << ");";
+  } else {
+    code << "mm_Asub[inputRow][inputCol] = mm_readA(batch, globalRowStart + inputRow, "
+         << "kStart / innerElementSize + inputCol" << ((batch_dims && batch_dims->Rank() > 0) ? ", batchIndices" : "") << ");";
+  }
+  return code.str();
 }
 
-Printable WriteDataToSubASnippetImpl(bool transpose_a, const ShaderIndicesHelper* batch_dims) {
-  return Printable([&](std::ostream& code) {
-    if (transpose_a) {
-      code << "mm_Asub[inputRow][inputCol] = mm_readA(batch, "
-           << "kStart + inputRow, "
-           << "globalRowStart + inputCol"
-           << ((batch_dims && batch_dims->Rank() > 0) ? ", batchIndices" : "")
-           << ");";
-    } else {
-      code << "mm_Asub[inputRow][inputCol] = mm_readA(batch, "
-           << "globalRowStart + inputRow, "
-           << "kStart + inputCol"
-           << ((batch_dims && batch_dims->Rank() > 0) ? ", batchIndices" : "")
-           << ");";
-    }
-  });
+std::string WriteDataToSubASnippetImpl(bool transpose_a, const ShaderIndicesHelper* batch_dims) {
+  std::ostringstream code;
+  if (transpose_a) {
+    code << "mm_Asub[inputRow][inputCol] = mm_readA(batch, "
+         << "kStart + inputRow, "
+         << "globalRowStart + inputCol"
+         << ((batch_dims && batch_dims->Rank() > 0) ? ", batchIndices" : "")
+         << ");";
+  } else {
+    code << "mm_Asub[inputRow][inputCol] = mm_readA(batch, "
+         << "globalRowStart + inputRow, "
+         << "kStart + inputCol"
+         << ((batch_dims && batch_dims->Rank() > 0) ? ", batchIndices" : "")
+         << ");";
+  }
+  return code.str();
 }
 
-Printable GenerateReadBCodeImpl(const std::string& batch, const std::string& row,
-                                const std::string& col, const ShaderIndicesHelper* batch_dims) {
-  return Printable([&](std::ostream& code) {
-    code << "mm_readB(" << batch << ", " << row << ", " << col
-         << ((batch_dims && batch_dims->Rank() > 0) ? ", batchIndices" : "") << ")";
-  });
+std::string GenerateReadBCodeImpl(const std::string& batch, const std::string& row,
+                                  const std::string& col, const ShaderIndicesHelper* batch_dims) {
+  std::ostringstream code;
+  code << "mm_readB(" << batch << ", " << row << ", " << col
+       << ((batch_dims && batch_dims->Rank() > 0) ? ", batchIndices" : "") << ")";
+  return code.str();
 }
 
-Printable GenerateComputationLoopImpl(bool transpose_a, uint32_t inner_element_size) {
-  return Printable([&](std::ostream& code) {
-    code << "    for (var k = 0; k < tileInner; k = k + 1) {\n"
-         << "        let BCached0 = mm_Bsub[k][globalCol / 4];\n\n"
-         << "        let BCached1 = mm_Bsub[k * innerElementSize + 1][tileCol];\n\n"
-         << "        let BCached2 = mm_Bsub[k * innerElementSize + 2][tileCol];";
+std::string GenerateComputationLoopImpl(bool transpose_a, uint32_t inner_element_size) {
+  std::ostringstream code;
+  code << "    for (var k = 0; k < tileInner; k = k + 1) {\n"
+       << "        let BCached0 = mm_Bsub[k][globalCol / 4];\n\n"
+       << "        let BCached1 = mm_Bsub[k * innerElementSize + 1][tileCol];\n\n"
+       << "        let BCached2 = mm_Bsub[k * innerElementSize + 2][tileCol];";
+  if (inner_element_size == 3) {
+    code << "        let BCached3 = mm_Bsub[k * innerElementSize + 3][tileCol];\n";
+  }
+
+  if (transpose_a) {
+    code << "        let ACached0 = mm_Asub[k * innerElementSize][localRow];\n"
+         << "        let ACached1 = mm_Asub[k * innerElementSize + 1][localRow];\n"
+         << "        let ACached2 = mm_Asub[k * innerElementSize + 2][localRow];\n";
     if (inner_element_size == 3) {
-      code << "        let BCached3 = mm_Bsub[k * innerElementSize + 3][tileCol];\n";
+      code << "        let ACached3 = mm_Asub[k * innerElementSize + 3][localRow];\n";
     }
 
-    if (transpose_a) {
-      code << "        let ACached0 = mm_Asub[k * innerElementSize][localRow];\n"
-           << "        let ACached1 = mm_Asub[k * innerElementSize + 1][localRow];\n"
-           << "        let ACached2 = mm_Asub[k * innerElementSize + 2][localRow];\n";
-      if (inner_element_size == 3) {
-        code << "        let ACached3 = mm_Asub[k * innerElementSize + 3][localRow];\n";
-      }
-
-      code << "        for (var i = 0; i < rowPerThread; i = i + 1) {\n"
-           << "          acc[i] = fma(BCached0, ACached0[i], acc[i]);\n"
-           << "          acc[i] = fma(BCached0, ACached1[i], acc[i]);\n"
-           << "          acc[i] = fma(BCached0, ACached2[i], acc[i]);\n";
-      if (inner_element_size == 3) {
-        code << "          acc[i] = fma(BCached0, ACached3[i], acc[i]);\n";
-      }
-      code << "        }\n";
-    } else {
-      code << "        for (var i = 0; i < rowPerThread; i = i + 1) {\n"
-           << "          let ACached = mm_Asub[tileRow + i][k];\n"
-           << "          acc[i] = fma(BCached0, ACached.x, acc[i]);\n"
-           << "          acc[i] = fma(BCached0, ACached.y, acc[i]);\n"
-           << "          acc[i] = fma(BCached0, ACached.z, acc[i]);\n";
-      if (inner_element_size == 3) {
-        code << "          acc[i] = fma(BCached0, ACached.w, acc[i]);\n";
-      }
-      code << "        }\n";
+    code << "        for (var i = 0; i < rowPerThread; i = i + 1) {\n"
+         << "          acc[i] = fma(BCached0, ACached0[i], acc[i]);\n"
+         << "          acc[i] = fma(BCached0, ACached1[i], acc[i]);\n"
+         << "          acc[i] = fma(BCached0, ACached2[i], acc[i]);\n";
+    if (inner_element_size == 3) {
+      code << "          acc[i] = fma(BCached0, ACached3[i], acc[i]);\n";
     }
+    code << "        }\n";
+  } else {
+    code << "        for (var i = 0; i < rowPerThread; i = i + 1) {\n"
+         << "          let ACached = mm_Asub[tileRow + i][k];\n"
+         << "          acc[i] = fma(BCached0, ACached.x, acc[i]);\n"
+         << "          acc[i] = fma(BCached0, ACached.y, acc[i]);\n"
+         << "          acc[i] = fma(BCached0, ACached.z, acc[i]);\n";
+    if (inner_element_size == 3) {
+      code << "          acc[i] = fma(BCached0, ACached.w, acc[i]);\n";
+    }
+    code << "        }\n";
+  }
 
-    code << "    }\n";
-  });
+  code << "    }\n";
+  return code.str();
 }
 
-Printable GenerateOutputCodeImpl() {
-  return Printable([&](std::ostream& code) {
-    code << "for (var innerRow = 0; innerRow < rowPerThread; innerRow = innerRow + 1) {\n"
-            "    mm_write(batch, globalRow + innerRow, globalCol, acc[innerRow]);\n"
-            "}\n";
-  });
+std::string GenerateOutputCodeImpl() {
+  std::ostringstream code;
+  code << "for (var innerRow = 0; innerRow < rowPerThread; innerRow = innerRow + 1) {\n"
+          "    mm_write(batch, globalRow + innerRow, globalCol, acc[innerRow]);\n"
+          "}\n";
+  return code.str();
 }
 
 void GenerateMatMulPackedVec4Code(OStringStream& additional_implementation,
@@ -1102,7 +1102,7 @@ void Conv::CalculateOutputShape(const ComputeContext& context, const ConvAttribu
   const auto& input_shape = input_tensor->Shape().GetDims();
 
   // Extract attributes
-  const auto& kernel_shape = attributes.kernel_shape;
+  const auto& kernel_shape = context.Input(1)->Shape().GetDims();
   const auto& dilations = attributes.dilations;
   const auto& adjust_pads = attributes.pads;
   const auto& strides = attributes.strides;
@@ -1644,7 +1644,7 @@ Status NaiveMatmulProgram::GenerateShaderCode(ShaderHelper& shader) const {
 
   // Helper function to generate calculation result
   auto generate_calc_result = [&]() {
-    return Printable([&](std::ostream& cal_str) {
+    return Printable([=](std::ostream& cal_str) {
       cal_str << "var a_data: " << "a_value_t" << ";\n";
 
       // Generate b_data loads
@@ -1748,74 +1748,74 @@ Status MatmulProgram::GenerateShaderCode(ShaderHelper& shader) const {
   return Status::OK();
 }
 
-Printable MatmulProgram::GenerateMatMulReadWriteFnSource(const std::vector<const ShaderVariableHelper*>& variables) const {
-  return Printable([&](std::ostream& code) {
-    // Get variables from vector instead of lookup
-    const auto& batch_dims = *variables[0];  // Batch dimensions
-    const auto& a = *variables[1];           // Matrix A
-    const auto& b = *variables[2];           // Matrix B
-    const auto& output = *variables[3];      // Output
+std::string MatmulProgram::GenerateMatMulReadWriteFnSource(const std::vector<const ShaderVariableHelper*>& variables) const {
+  std::ostringstream code;
+  // Get variables from vector instead of lookup
+  const auto& batch_dims = *variables[0];  // Batch dimensions
+  const auto& a = *variables[1];           // Matrix A
+  const auto& b = *variables[2];           // Matrix B
+  const auto& output = *variables[3];      // Output
 
-    const std::string type_snippet = (attributes_.components > 1)
-                                         ? absl::StrCat("vec", attributes_.components, "<", std::string(batch_dims.ValueType()), ">")
-                                         : std::string(batch_dims.ValueType());
-    const std::string zero_value = absl::StrCat(type_snippet, "(0.0)");
+  const std::string type_snippet = (attributes_.components > 1)
+                                       ? absl::StrCat("vec", attributes_.components, "<", std::string(batch_dims.ValueType()), ">")
+                                       : std::string(batch_dims.ValueType());
+  const std::string zero_value = absl::StrCat(type_snippet, "(0.0)");
 
-    // Generate mm_readA function
-    code << "fn mm_readA(batch: i32, row: i32, colIn: i32"
-         << (batch_dims.Rank() > 0 ? ", batchIndices: batchDims_indices_t" : "")
-         << ") -> " << type_snippet << " {\n"
-         << "  var value = " << zero_value << ";\n"
-         << "  let col = colIn * " << attributes_.components << ";\n"
-         << "  if(row < uniforms.dim_a_outer && col < uniforms.dim_inner) {\n"
-         << "    var aIndices: " << "a_indices_t" << ";\n"
-         << ConvertOutputBatchIndicesToInputBatchIndices("aIndices", a, a.Rank() - 2, batch_dims.Rank(), "batchIndices")
-         << "    " << a.IndicesSet("aIndices", a.Rank() - 2, "u32(row)") << "\n"
-         << "    " << a.IndicesSet("aIndices", a.Rank() - 1, "u32(colIn)") << "\n"
-         << "    value = " << a.GetByIndices("aIndices") << ";\n"
-         << "  }\n"
-         << "  return value;\n"
-         << "}\n\n";
+  // Generate mm_readA function
+  code << "fn mm_readA(batch: i32, row: i32, colIn: i32"
+       << (batch_dims.Rank() > 0 ? ", batchIndices: batchDims_indices_t" : "")
+       << ") -> " << type_snippet << " {\n"
+       << "  var value = " << zero_value << ";\n"
+       << "  let col = colIn * " << attributes_.components << ";\n"
+       << "  if(row < uniforms.dim_a_outer && col < uniforms.dim_inner) {\n"
+       << "    var aIndices: " << "a_indices_t" << ";\n"
+       << ConvertOutputBatchIndicesToInputBatchIndices("aIndices", a, a.Rank() - 2, batch_dims.Rank(), "batchIndices")
+       << "    " << a.IndicesSet("aIndices", a.Rank() - 2, "u32(row)") << "\n"
+       << "    " << a.IndicesSet("aIndices", a.Rank() - 1, "u32(colIn)") << "\n"
+       << "    value = " << a.GetByIndices("aIndices") << ";\n"
+       << "  }\n"
+       << "  return value;\n"
+       << "}\n\n";
 
-    // Generate mm_readB function
-    code << "fn mm_readB(batch: i32, row: i32, colIn: i32"
-         << (batch_dims.Rank() > 0 ? ", batchIndices: batchDims_indices_t" : "")
-         << ") -> " << type_snippet << " {\n"
-         << "  var value = " << zero_value << ";\n"
-         << "  let col = colIn * " << attributes_.components << ";\n"
-         << "  if(row < uniforms.dim_inner && col < uniforms.dim_b_outer) {\n"
-         << "    var bIndices: " << "b_indices_t" << ";\n"
-         << ConvertOutputBatchIndicesToInputBatchIndices("bIndices", b, b.Rank() - 2, batch_dims.Rank(), "batchIndices")
-         << "    " << b.IndicesSet("bIndices", b.Rank() - 2, "u32(row)") << "\n"
-         << "    " << b.IndicesSet("bIndices", b.Rank() - 1, "u32(colIn)") << "\n"
-         << "    value = " << b.GetByIndices("bIndices") << ";\n"
-         << "  }\n"
-         << "  return value;\n"
-         << "}\n\n";
+  // Generate mm_readB function
+  code << "fn mm_readB(batch: i32, row: i32, colIn: i32"
+       << (batch_dims.Rank() > 0 ? ", batchIndices: batchDims_indices_t" : "")
+       << ") -> " << type_snippet << " {\n"
+       << "  var value = " << zero_value << ";\n"
+       << "  let col = colIn * " << attributes_.components << ";\n"
+       << "  if(row < uniforms.dim_inner && col < uniforms.dim_b_outer) {\n"
+       << "    var bIndices: " << "b_indices_t" << ";\n"
+       << ConvertOutputBatchIndicesToInputBatchIndices("bIndices", b, b.Rank() - 2, batch_dims.Rank(), "batchIndices")
+       << "    " << b.IndicesSet("bIndices", b.Rank() - 2, "u32(row)") << "\n"
+       << "    " << b.IndicesSet("bIndices", b.Rank() - 1, "u32(colIn)") << "\n"
+       << "    value = " << b.GetByIndices("bIndices") << ";\n"
+       << "  }\n"
+       << "  return value;\n"
+       << "}\n\n";
 
-    // Generate mm_write function
-    code << "fn mm_write(batch: i32, row: i32, colIn: i32, valueIn: " << type_snippet << ") {\n"
-         << "  let col = colIn * " << attributes_.components << ";\n"
-         << "  if (row < uniforms.dim_a_outer && col < uniforms.dim_b_outer) {\n"
-         << "    var value = valueIn;\n"
-         << "    let coords = vec3<i32>(batch, row, colIn);\n";
+  // Generate mm_write function
+  code << "fn mm_write(batch: i32, row: i32, colIn: i32, valueIn: " << type_snippet << ") {\n"
+       << "  let col = colIn * " << attributes_.components << ";\n"
+       << "  if (row < uniforms.dim_a_outer && col < uniforms.dim_b_outer) {\n"
+       << "    var value = valueIn;\n"
+       << "    let coords = vec3<i32>(batch, row, colIn);\n";
 
-    // Add bias if needed
-    if (attributes_.has_bias) {
-      if (attributes_.is_channels_last) {
-        code << "    value = value + bias[colIn];\n";
-      } else {
-        code << "    value = value + " << type_snippet << "(bias[row]);\n";
-      }
+  // Add bias if needed
+  if (attributes_.has_bias) {
+    if (attributes_.is_channels_last) {
+      code << "    value = value + bias[colIn];\n";
+    } else {
+      code << "    value = value + " << type_snippet << "(bias[row]);\n";
     }
+  }
 
-    // Add activation
-    const std::string apply_activation = GetActivationSnippet(attributes_.activationAttributes, type_snippet, "output_value_t");
-    code << "    " << apply_activation << "\n"
-         << "    " << output.SetByIndices("vec3<u32>(coords)", "value") << "\n"
-         << "  }\n"
-         << "}\n";
-  });
+  // Add activation
+  const std::string apply_activation = GetActivationSnippet(attributes_.activationAttributes, type_snippet, "output_value_t");
+  code << "    " << apply_activation << "\n"
+       << "    " << output.SetByIndices("vec3<u32>(coords)", "value") << "\n"
+       << "  }\n"
+       << "}\n";
+  return code.str();
 }
 
 Status Conv2DMatMulProgram::GenerateShaderCode(ShaderHelper& shader) const {
@@ -1948,7 +1948,7 @@ std::string Conv2DMatMulProgram::GenerateTypeSnippet(uint32_t size, const std::s
   }
 }
 
-Printable Conv2DMatMulProgram::GenerateConv2DCommonSnippet(
+std::string Conv2DMatMulProgram::GenerateConv2DCommonSnippet(
     bool is_channels_last,
     bool fit_a_outer,
     bool fit_b_outer,
@@ -1959,92 +1959,92 @@ Printable Conv2DMatMulProgram::GenerateConv2DCommonSnippet(
     uint32_t inner_element_size_x,
     uint32_t inner_element_size_w,
     uint32_t inner_element_size) const {
-  return Printable([&](std::ostream& code) {
-    const std::string coord_a_snippet = is_channels_last
-                                            ? "let coord = vec4<i32>(batch, xRow, xCol, xCh);"
-                                            : "let coord = vec4<i32>(batch, xCh, xRow, xCol);";
+  std::ostringstream code;
+  const std::string coord_a_snippet = is_channels_last
+                                          ? "let coord = vec4<i32>(batch, xRow, xCol, xCh);"
+                                          : "let coord = vec4<i32>(batch, xCh, xRow, xCol);";
 
-    const std::string coord_res_snippet = is_channels_last
-                                              ? "let coords = vec4<i32>(batch, row / outWidth, row %% outWidth, col);"
-                                              : "let coords = vec4<i32>(batch, row, col / outWidth, col %% outWidth);";
+  const std::string coord_res_snippet = is_channels_last
+                                            ? "let coords = vec4<i32>(batch, row / outWidth, row %% outWidth, col);"
+                                            : "let coords = vec4<i32>(batch, row, col / outWidth, col %% outWidth);";
 
-    const std::string x_height = is_channels_last ? "i32(uniforms.x_shape[1])" : "i32(uniforms.x_shape[2])";
-    const std::string x_width = is_channels_last ? "i32(uniforms.x_shape[2])" : "i32(uniforms.x_shape[3])";
-    const std::string row = is_channels_last ? "row" : "col";
-    const std::string col = is_channels_last ? "col" : "row";
+  const std::string x_height = is_channels_last ? "i32(uniforms.x_shape[1])" : "i32(uniforms.x_shape[2])";
+  const std::string x_width = is_channels_last ? "i32(uniforms.x_shape[2])" : "i32(uniforms.x_shape[3])";
+  const std::string row = is_channels_last ? "row" : "col";
+  const std::string col = is_channels_last ? "col" : "row";
 
-    // Build read_x_snippet
-    std::stringstream read_x;
-    read_x << "let inChannels = i32(uniforms.w_shape[2]);\n"
-           << "let outWidth = " << (is_channels_last ? "i32(uniforms.result_shape[2])" : "i32(uniforms.result_shape[3])") << ";\n"
-           << "let outRow = " << row << " / outWidth;\n"
-           << "let outCol = " << row << " %% outWidth;\n\n"
-           << "let WRow = " << col << " / (i32(uniforms.w_shape[1]) * inChannels);\n"
-           << "let WCol = " << col << " / inChannels %% i32(uniforms.w_shape[1]);\n"
-           << "let xRow = outRow * uniforms.stride[0] + uniforms.dilation[0] * WRow - uniforms.pad[0];\n"
-           << "let xCol = outCol * uniforms.stride[1] + uniforms.dilation[1] * WCol - uniforms.pad[1];\n"
-           << "let xCh = " << col << " %% inChannels;\n"
-           << "var resData = " << GenerateTypeSnippet(inner_element_size_x, data_type) << "(0.0);\n"
-           << "if (xRow >= 0 && xRow < " << x_height << " && xCol >= 0 && xCol < " << x_width << ") {\n"
-           << "  " << coord_a_snippet << "\n"
-           << "  let xIndex = getIndexFromCoords4D(coord, vec4<i32>(uniforms.x_shape));\n"
-           << "  " << GetXSnippet(inner_element_size_x, data_type) << "\n"
-           << "}\n"
-           << "return resData;";
+  // Build read_x_snippet
+  std::stringstream read_x;
+  read_x << "let inChannels = i32(uniforms.w_shape[2]);\n"
+         << "let outWidth = " << (is_channels_last ? "i32(uniforms.result_shape[2])" : "i32(uniforms.result_shape[3])") << ";\n"
+         << "let outRow = " << row << " / outWidth;\n"
+         << "let outCol = " << row << " %% outWidth;\n\n"
+         << "let WRow = " << col << " / (i32(uniforms.w_shape[1]) * inChannels);\n"
+         << "let WCol = " << col << " / inChannels %% i32(uniforms.w_shape[1]);\n"
+         << "let xRow = outRow * uniforms.stride[0] + uniforms.dilation[0] * WRow - uniforms.pad[0];\n"
+         << "let xCol = outCol * uniforms.stride[1] + uniforms.dilation[1] * WCol - uniforms.pad[1];\n"
+         << "let xCh = " << col << " %% inChannels;\n"
+         << "var resData = " << GenerateTypeSnippet(inner_element_size_x, data_type) << "(0.0);\n"
+         << "if (xRow >= 0 && xRow < " << x_height << " && xCol >= 0 && xCol < " << x_width << ") {\n"
+         << "  " << coord_a_snippet << "\n"
+         << "  let xIndex = getIndexFromCoords4D(coord, vec4<i32>(uniforms.x_shape));\n"
+         << "  " << GetXSnippet(inner_element_size_x, data_type) << "\n"
+         << "}\n"
+         << "return resData;";
 
-    const std::string sample_x = is_channels_last
-                                     ? (fit_a_outer && fit_inner)
-                                           ? absl::StrCat("let col = colIn * ", inner_element_size_x, ";\n", read_x.str())
-                                           : absl::StrCat("let col = colIn * ", inner_element_size_x,
-                                                          ";\nif (row < uniforms.dim_a_outer && col < uniforms.dim_inner) {\n",
-                                                          read_x.str(), "\n}\nreturn ", GenerateTypeSnippet(inner_element_size_x, data_type), "(0.0);")
-                                 : (fit_inner && fit_b_outer)
-                                     ? absl::StrCat("let col = colIn * ", inner_element_size_x, ";\n", read_x.str())
-                                     : absl::StrCat("let col = colIn * ", inner_element_size_x,
-                                                    ";\nif (row < uniforms.dim_inner && col < uniforms.dim_b_outer) {\n",
-                                                    read_x.str(), "\n}\nreturn ", GenerateTypeSnippet(inner_element_size_x, data_type), "(0.0);");
+  const std::string sample_x = is_channels_last
+                                   ? (fit_a_outer && fit_inner)
+                                         ? absl::StrCat("let col = colIn * ", inner_element_size_x, ";\n", read_x.str())
+                                         : absl::StrCat("let col = colIn * ", inner_element_size_x,
+                                                        ";\nif (row < uniforms.dim_a_outer && col < uniforms.dim_inner) {\n",
+                                                        read_x.str(), "\n}\nreturn ", GenerateTypeSnippet(inner_element_size_x, data_type), "(0.0);")
+                               : (fit_inner && fit_b_outer)
+                                   ? absl::StrCat("let col = colIn * ", inner_element_size_x, ";\n", read_x.str())
+                                   : absl::StrCat("let col = colIn * ", inner_element_size_x,
+                                                  ";\nif (row < uniforms.dim_inner && col < uniforms.dim_b_outer) {\n",
+                                                  read_x.str(), "\n}\nreturn ", GenerateTypeSnippet(inner_element_size_x, data_type), "(0.0);");
 
-    const std::string sample_w = is_channels_last
-                                     ? (fit_inner && fit_b_outer)
-                                           ? GetWSnippet(inner_element_size_w)
-                                           : absl::StrCat("let col = colIn * ", inner_element_size_w,
-                                                          ";\nif (row < uniforms.dim_inner && col < uniforms.dim_b_outer) {\n",
-                                                          GetWSnippet(inner_element_size_w), "\n}\nreturn ",
-                                                          GenerateTypeSnippet(inner_element_size_w, data_type), "(0.0);")
-                                     : absl::StrCat("let col = colIn * ", inner_element_size_w,
-                                                    ";\nif (row < uniforms.dim_inner && col < uniforms.dim_a_outer) {\n",
-                                                    GetWSnippet(inner_element_size_w), "\n}\nreturn ",
-                                                    GenerateTypeSnippet(inner_element_size_w, data_type), "(0.0);");
+  const std::string sample_w = is_channels_last
+                                   ? (fit_inner && fit_b_outer)
+                                         ? GetWSnippet(inner_element_size_w)
+                                         : absl::StrCat("let col = colIn * ", inner_element_size_w,
+                                                        ";\nif (row < uniforms.dim_inner && col < uniforms.dim_b_outer) {\n",
+                                                        GetWSnippet(inner_element_size_w), "\n}\nreturn ",
+                                                        GenerateTypeSnippet(inner_element_size_w, data_type), "(0.0);")
+                                   : absl::StrCat("let col = colIn * ", inner_element_size_w,
+                                                  ";\nif (row < uniforms.dim_inner && col < uniforms.dim_a_outer) {\n",
+                                                  GetWSnippet(inner_element_size_w), "\n}\nreturn ",
+                                                  GenerateTypeSnippet(inner_element_size_w, data_type), "(0.0);");
 
-    const std::string res_type = GenerateTypeSnippet(inner_element_size, data_type);
-    const std::string a_type = is_channels_last ? GenerateTypeSnippet(inner_element_size_x, data_type)
-                                                : GenerateTypeSnippet(inner_element_size_w, data_type);
-    const std::string b_type = is_channels_last ? GenerateTypeSnippet(inner_element_size_w, data_type)
-                                                : GenerateTypeSnippet(inner_element_size_x, data_type);
+  const std::string res_type = GenerateTypeSnippet(inner_element_size, data_type);
+  const std::string a_type = is_channels_last ? GenerateTypeSnippet(inner_element_size_x, data_type)
+                                              : GenerateTypeSnippet(inner_element_size_w, data_type);
+  const std::string b_type = is_channels_last ? GenerateTypeSnippet(inner_element_size_w, data_type)
+                                              : GenerateTypeSnippet(inner_element_size_x, data_type);
 
-    // Build final code
-    code << "fn mm_readA(batch: i32, row: i32, colIn: i32) -> " << a_type << " {\n"
-         << "  " << (is_channels_last ? sample_x : sample_w) << "\n"
-         << "}\n\n"
-         << "fn mm_readB(batch: i32, row: i32, colIn: i32) -> " << b_type << " {\n"
-         << "  " << (is_channels_last ? sample_w : sample_x) << "\n"
-         << "}\n\n"
-         << "fn mm_write(batch: i32, row: i32, colIn: i32, valueIn: " << res_type << ") {\n"
-         << "  let col = colIn * " << inner_element_size << ";\n"
-         << "  if (row < uniforms.dim_a_outer && col < uniforms.dim_b_outer) {\n"
-         << "    var value = valueIn;\n"
-         << "    let outWidth = " << (is_channels_last ? "i32(uniforms.result_shape[2])" : "i32(uniforms.result_shape[3])") << ";\n"
-         << "    " << coord_res_snippet << "\n";
+  // Build final code
+  code << "fn mm_readA(batch: i32, row: i32, colIn: i32) -> " << a_type << " {\n"
+       << "  " << (is_channels_last ? sample_x : sample_w) << "\n"
+       << "}\n\n"
+       << "fn mm_readB(batch: i32, row: i32, colIn: i32) -> " << b_type << " {\n"
+       << "  " << (is_channels_last ? sample_w : sample_x) << "\n"
+       << "}\n\n"
+       << "fn mm_write(batch: i32, row: i32, colIn: i32, valueIn: " << res_type << ") {\n"
+       << "  let col = colIn * " << inner_element_size << ";\n"
+       << "  if (row < uniforms.dim_a_outer && col < uniforms.dim_b_outer) {\n"
+       << "    var value = valueIn;\n"
+       << "    let outWidth = " << (is_channels_last ? "i32(uniforms.result_shape[2])" : "i32(uniforms.result_shape[3])") << ";\n"
+       << "    " << coord_res_snippet << "\n";
 
-    if (add_bias) {
-      code << "    value = value + getBiasByOutputCoords(coords);\n";
-    }
+  if (add_bias) {
+    code << "    value = value + getBiasByOutputCoords(coords);\n";
+  }
 
-    code << "    " << GetActivationSnippet(attributes, res_type, data_type) << "\n"
-         << "    setOutputAtCoords(coords[0], coords[1], coords[2], coords[3], value);\n"
-         << "  }\n"
-         << "}\n";
-  });
+  code << "    " << GetActivationSnippet(attributes, res_type, data_type) << "\n"
+       << "    setOutputAtCoords(coords[0], coords[1], coords[2], coords[3], value);\n"
+       << "  }\n"
+       << "}\n";
+  return code.str();
 }
 
 }  // namespace webgpu
