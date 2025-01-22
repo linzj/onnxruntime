@@ -112,21 +112,10 @@ Status DepthToSpace::ComputeInternal(ComputeContext& context) const {
   CalculateShapeAndPerm(input_shape, reshaped_shape, perm);
 
   // Calculate output shape
-  std::vector<int64_t> output_shape(4);
-  const auto& dims = input_shape.GetDims();
-  const int64_t blocksize = attributes_.blocksize;
   int components;
   if (attributes_.nchw) {
-    output_shape[0] = dims[0];                            // N
-    output_shape[1] = dims[1] / (blocksize * blocksize);  // C
-    output_shape[2] = dims[2] * blocksize;                // H
-    output_shape[3] = dims[3] * blocksize;                // W
     components = 1;
   } else {
-    output_shape[0] = dims[0];                            // N
-    output_shape[1] = dims[1] * blocksize;                // H
-    output_shape[2] = dims[2] * blocksize;                // W
-    output_shape[3] = dims[3] / (blocksize * blocksize);  // C
     components = 4;
   }
 
@@ -142,16 +131,16 @@ Status DepthToSpace::ComputeInternal(ComputeContext& context) const {
   program->attributes_.input_dims = std::vector<int64_t>(input_shape.GetDims().begin(), input_shape.GetDims().end());
 
   // Configure inputs/outputs
-  program->AddInputs({{input_tensor, ProgramTensorMetadataDependency::TypeAndShape, TensorShape(reshaped_shape), components}});
-  program->AddOutput({context.Output(0, TensorShape(output_shape)), ProgramTensorMetadataDependency::None});
+  program->AddInputs({{input_tensor, ProgramTensorMetadataDependency::TypeAndRank, TensorShape(reshaped_shape), components}});
+  program->AddOutput({context.Output(0, TensorShape(reshaped_shape)), ProgramTensorMetadataDependency::None});
 
   // Set dispatch size
   program->SetDispatchGroupSize(
-      static_cast<uint32_t>((TensorShape(output_shape).Size() + 63) / 64)  // Workgroup size of 64
+      static_cast<uint32_t>((TensorShape(reshaped_shape).Size() + 63) / 64)  // Workgroup size of 64
   );
 
   // Add uniform variables
-  program->AddUniformVariables({{static_cast<uint32_t>(TensorShape(output_shape).Size())}});
+  program->AddUniformVariables({{static_cast<uint32_t>(TensorShape(reshaped_shape).Size())}});
 
   // Run the program
   return context.RunProgram(*program);
@@ -159,8 +148,8 @@ Status DepthToSpace::ComputeInternal(ComputeContext& context) const {
 
 Status DepthToSpaceProgram::GenerateShaderCode(ShaderHelper& shader) const {
   // Setup input/output variables
-  const auto& input = shader.AddInput("x", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias);
-  const auto& output = shader.AddOutput("output", ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias);
+  const auto& input = shader.AddInput("x", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias);
+  const auto& output = shader.AddOutput("output", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias | ShaderUsage::UseIndicesTypeAlias);
 
   // Generate permutation function
   OStringStream& perm_function = shader.AdditionalImplementation();
