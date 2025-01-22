@@ -59,9 +59,6 @@ class GroupedConvVectorizeProgram : public Program<GroupedConvVectorizeProgram> 
     uint32_t components;
     uint32_t output_number;
     uint32_t x_number;
-    std::vector<uint32_t> x_shape;
-    std::vector<uint32_t> w_shape;
-    std::vector<uint32_t> output_shape;
     std::vector<int32_t> strides;
     std::vector<int32_t> pads;
     bool has_bias;
@@ -92,9 +89,6 @@ class GroupedConvProgram : public Program<GroupedConvProgram> {
     uint32_t output_channels_per_group;
     bool has_bias;
     bool is_channel_last;
-    std::vector<uint32_t> x_shape;
-    std::vector<uint32_t> w_shape;
-    std::vector<uint32_t> output_shape;
   };
 
   Attributes attributes_;

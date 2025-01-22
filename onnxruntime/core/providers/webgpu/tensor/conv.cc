@@ -263,27 +263,27 @@ Status RunGroupedConvVectorizeProgram(
     const TensorShapeVector& output_shape,
     Tensor*& output_tensor) {
   const bool has_bias = inputs.size() > 2;
-  const uint32_t components = GetMaxComponents(output_shape[3]);
+  const int components = GetMaxComponents(output_shape[3]);
   const uint32_t output_number = GetMaxComponents(output_shape[2]);
   const size_t output_size = TensorShape(output_shape).Size() / components / output_number;
 
-  std::vector<uint32_t> x_shape = {
-      static_cast<uint32_t>(inputs[0]->Shape()[0]),
-      static_cast<uint32_t>(inputs[0]->Shape()[1]),
-      static_cast<uint32_t>(inputs[0]->Shape()[2]),
-      static_cast<uint32_t>(inputs[0]->Shape()[3] / components)};
+  TensorShapeVector x_shape = {
+      inputs[0]->Shape()[0],
+      inputs[0]->Shape()[1],
+      inputs[0]->Shape()[2],
+      inputs[0]->Shape()[3] / components};
 
-  std::vector<uint32_t> w_shape = {
-      static_cast<uint32_t>(inputs[1]->Shape()[0]),
-      static_cast<uint32_t>(inputs[1]->Shape()[1]),
-      static_cast<uint32_t>(inputs[1]->Shape()[2]),
-      static_cast<uint32_t>(inputs[1]->Shape()[3] / components)};
+  TensorShapeVector w_shape = {
+      inputs[1]->Shape()[0],
+      inputs[1]->Shape()[1],
+      inputs[1]->Shape()[2],
+      inputs[1]->Shape()[3] / components};
 
-  std::vector<uint32_t> output_shape_in_shader = {
-      static_cast<uint32_t>(output_shape[0]),
-      static_cast<uint32_t>(output_shape[1]),
-      static_cast<uint32_t>(output_shape[2]),
-      static_cast<uint32_t>(output_shape[3] / components)};
+  TensorShapeVector output_shape_in_shader = {
+      output_shape[0],
+      output_shape[1],
+      output_shape[2],
+      output_shape[3] / components};
 
   const uint32_t x_number = (output_number - 1) * static_cast<uint32_t>(attributes.strides[1]) + static_cast<uint32_t>(w_shape[1]);
 
@@ -295,9 +295,6 @@ Status RunGroupedConvVectorizeProgram(
   program->attributes_.components = components;
   program->attributes_.output_number = output_number;
   program->attributes_.x_number = x_number;
-  program->attributes_.x_shape = x_shape;
-  program->attributes_.w_shape = w_shape;
-  program->attributes_.output_shape = output_shape_in_shader;
   program->attributes_.has_bias = has_bias;
   program->attributes_.strides = {
       static_cast<int32_t>(attributes.strides[0]),
@@ -307,14 +304,14 @@ Status RunGroupedConvVectorizeProgram(
       static_cast<int32_t>(attributes.pads[1])};
 
   // Configure inputs/outputs
-  program->AddInputs({{inputs[0], ProgramTensorMetadataDependency::TypeAndRank}});
-  program->AddInputs({{inputs[1], ProgramTensorMetadataDependency::None}});
+  program->AddInputs({{inputs[0], ProgramTensorMetadataDependency::TypeAndRank, TensorShape(x_shape), components}});
+  program->AddInputs({{inputs[1], ProgramTensorMetadataDependency::None, TensorShape(w_shape), components}});
   if (has_bias) {
-    program->AddInputs({{inputs[2], ProgramTensorMetadataDependency::None}});
+    program->AddInputs({{inputs[2], ProgramTensorMetadataDependency::None, inputs[2]->Shape(), components}});
   }
 
   output_tensor = context.Output(0, TensorShape(output_shape));
-  program->AddOutput({output_tensor, ProgramTensorMetadataDependency::TypeAndRank});
+  program->AddOutput({output_tensor, ProgramTensorMetadataDependency::TypeAndRank, TensorShape(output_shape_in_shader), components});
 
   // Set dispatch sizes
   program->SetDispatchGroupSize((static_cast<uint32_t>(output_size) + 63) / 64);
@@ -348,7 +345,7 @@ Status RunGroupedConvProgram(
   const bool is_channel_last = !attributes.nchw;
   const int64_t output_channels = is_channel_last ? output_shape[3] : output_shape[1];
   const int64_t output_channels_per_group = output_channels / attributes.group;
-  const uint32_t components = (is_channel_last && output_channels_per_group >= 4) ? GetMaxComponents(output_channels) : 1;
+  const int components = (is_channel_last && output_channels_per_group >= 4) ? GetMaxComponents(output_channels) : 1;
   const size_t output_size = TensorShape(output_shape).Size() / components;
 
   // Create program
@@ -362,33 +359,33 @@ Status RunGroupedConvProgram(
   program->attributes_.is_channel_last = is_channel_last;
 
   // Set tensor shapes
-  program->attributes_.x_shape = {
-      static_cast<uint32_t>(x_shape[0]),
-      static_cast<uint32_t>(x_shape[1]),
-      static_cast<uint32_t>(x_shape[2]),
-      static_cast<uint32_t>(x_shape[3])};
+  TensorShapeVector x_shape_in_shader = {
+      x_shape[0],
+      x_shape[1],
+      x_shape[2],
+      x_shape[3]};
 
-  program->attributes_.w_shape = {
-      static_cast<uint32_t>(w_shape[0]),
-      static_cast<uint32_t>(w_shape[1]),
-      static_cast<uint32_t>(w_shape[2]),
-      static_cast<uint32_t>(w_shape[3] / components)};
+  TensorShapeVector w_shape_in_shader = {
+      w_shape[0],
+      w_shape[1],
+      w_shape[2],
+      w_shape[3] / components};
 
-  program->attributes_.output_shape = {
-      static_cast<uint32_t>(output_shape[0]),
-      static_cast<uint32_t>(output_shape[1]),
-      static_cast<uint32_t>(output_shape[2]),
-      static_cast<uint32_t>(output_shape[3] / components)};
+  TensorShapeVector output_shape_in_shader = {
+      output_shape[0],
+      output_shape[1],
+      output_shape[2],
+      output_shape[3] / components};
 
   // Configure program inputs/outputs
   output_tensor = context.Output(0, TensorShape(output_shape));
 
-  program->AddInputs({{x, ProgramTensorMetadataDependency::TypeAndRank}});
-  program->AddInputs({{w, ProgramTensorMetadataDependency::TypeAndRank}});
+  program->AddInputs({{x, ProgramTensorMetadataDependency::TypeAndRank, TensorShape(x_shape_in_shader), components}});
+  program->AddInputs({{w, ProgramTensorMetadataDependency::TypeAndRank, TensorShape(w_shape_in_shader), components}});
   if (has_bias) {
     program->AddInputs({{b, ProgramTensorMetadataDependency::None}});
   }
-  program->AddOutput({output_tensor, ProgramTensorMetadataDependency::None});
+  program->AddOutput({output_tensor, ProgramTensorMetadataDependency::None, TensorShape(output_shape_in_shader), components});
 
   // Set dispatch size
   program->SetDispatchGroupSize((static_cast<uint32_t>(output_size) + 63) / 64);
@@ -427,7 +424,7 @@ Status RunNaiveMatmulProgram(
   const int64_t M = a_shape[a_shape.size() - 2];
   const int64_t N = b_shape[b_shape.size() - 1];
   const int64_t K = a_shape[a_shape.size() - 1];
-  const uint32_t components = GetMaxComponents(N);
+  const int components = GetMaxComponents(N);
   const uint32_t a_components = GetMaxComponents(K);
   const uint32_t output_number = GetMaxComponents(M);
 
@@ -470,7 +467,7 @@ Status RunNaiveMatmulProgram(
 
   // Configure program outputs
   auto* output_tensor = context.Output(0, TensorShape(output_shape));
-  program->AddOutput({output_tensor, ProgramTensorMetadataDependency::None});
+  program->AddOutput({output_tensor, ProgramTensorMetadataDependency::None, TensorShape(output_shape_in_shader), components});
 
   // Set dispatch size
   program->SetDispatchGroupSize((static_cast<uint32_t>(output_size) + 63) / 64);
@@ -541,7 +538,6 @@ Status RunMatmulProgram(
   // Create TensorShape objects
   TensorShape a_shape_tensor(a_shape_tmp);
   TensorShape b_shape_tensor(b_shape_tmp);
-  TensorShape output_shape_tensor(output_shape_tmp);
 
   // Setup MatmulProgram attributes
   auto program = std::make_unique<MatmulProgram>();
@@ -578,7 +574,7 @@ Status RunMatmulProgram(
   auto outer_dims_tensor = context.CreateGPUTensor(A->DataType(), TensorShape(outer_dims_int64));
   program->AddInputs({{&outer_dims_tensor, ProgramTensorMetadataDependency::TypeAndRank, 1}});
 
-  program->AddOutput({context.Output(0, output_shape_tensor), ProgramTensorMetadataDependency::None, output_shape_tensor, static_cast<int>(components)});
+  program->AddOutput({context.Output(0, output_shape), ProgramTensorMetadataDependency::None, TensorShape(output_shape_tmp), static_cast<int>(components)});
 
   // Add uniform variables
   program->AddUniformVariables({{static_cast<int32_t>(dim_a_outer)},
@@ -1514,7 +1510,7 @@ Status GroupedConvVectorizeProgram::GenerateShaderCode(ShaderHelper& shader) con
        << "let input_channel = output_channel;\n\n";
 
   // Main computation loop
-  code << "for (var w_height: u32 = 0u; w_height < " << attributes_.w_shape[0] << "u; w_height++) {\n"
+  code << "for (var w_height: u32 = 0u; w_height < " << "uniforms.w_shape[0]" << "; w_height++) {\n"
        << "  let x_height = x_corner.x + i32(w_height);\n"
        << "  if (x_height >= 0 && u32(x_height) < uniforms.x_shape[1]) {\n"
        << "    for (var i = 0; i < " << attributes_.x_number << "; i++) {\n"
@@ -1525,7 +1521,7 @@ Status GroupedConvVectorizeProgram::GenerateShaderCode(ShaderHelper& shader) con
        << "        x_vals[i] = " << "x_value_t" << "(0);\n"
        << "      }\n"
        << "    }\n"
-       << "    for (var w_width: u32 = 0u; w_width < " << attributes_.w_shape[1] << "u; w_width++) {\n"
+       << "    for (var w_width: u32 = 0u; w_width < " << "uniforms.w_shape[1]" << "u; w_width++) {\n"
        << "      let w_val = " << weights.GetByIndices("w_indices_t(w_height, w_width, 0, output_channel)") << ";\n"
        << "      for (var i = 0u; i < " << attributes_.output_number << "u; i++) {\n"
        << "        values[i] = fma(x_vals[i * u32(uniforms.strides[1]) + w_width], w_val, values[i]);\n"
