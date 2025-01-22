@@ -633,7 +633,7 @@ Status ResizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
                   << "    " << input.IndicesSet("input_indices", "i", "input_index") << ";\n"
                   << "  }\n"
                   << "  return input_indices;\n"
-                  << "}";
+                  << "}\n\n";
 
   // Define checkInputIndices function
   additional_impl << "fn checkInputIndices(input_indices: input_indices_t) -> bool {\n"

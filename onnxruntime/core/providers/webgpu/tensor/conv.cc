@@ -845,6 +845,7 @@ void GenerateMatMulPackedVec4Code(OStringStream& additional_implementation,
                                   OStringStream& main_function_body,
                                   const ShaderIndicesHelper* batch_dims,
                                   const std::array<uint32_t, 3>& workgroup_size,
+                                  const std::string& input_value_type,
                                   const std::array<uint32_t, 3>& elements_per_thread,
                                   uint32_t inner_element_size) {
   const uint32_t tile_a_outer = workgroup_size[1] * elements_per_thread[1];
@@ -856,7 +857,7 @@ void GenerateMatMulPackedVec4Code(OStringStream& additional_implementation,
   // Generate workgroup shared memory declarations
   additional_implementation
       << "var<workgroup> mm_Asub: array<array<vec" << inner_element_size
-      << "<input_value_t>, " << tile_a_width / inner_element_size << ">, " << tile_a_height << ">;\n"
+      << "<" << input_value_type << ">, " << tile_a_width / inner_element_size << ">, " << tile_a_height << ">;\n"
       << "var<workgroup> mm_Bsub: array<array<vec4<f32>, "
       << tile_b_outer / elements_per_thread[0] << ">, " << 32 << ">;\n\n"
       << "const rowPerThread = " << elements_per_thread[1] << ";\n"
@@ -866,22 +867,22 @@ void GenerateMatMulPackedVec4Code(OStringStream& additional_implementation,
 
   // Generate main computation
   main_function_body
-      << "let localRow = i32(localId.y);\n"
+      << "let localRow = i32(local_id.y);\n"
       << "let tileRow = localRow * rowPerThread;\n"
-      << "let tileCol = i32(localId.x);\n\n"
-      << "let globalRow = i32(globalId.y) * rowPerThread;\n"
-      << "let globalCol = i32(globalId.x);\n"
-      << "let batch = i32(globalId.z);\n";
+      << "let tileCol = i32(local_id.x);\n\n"
+      << "let globalRow = i32(global_id.y) * rowPerThread;\n"
+      << "let globalCol = i32(global_id.x);\n"
+      << "let batch = i32(global_id.z);\n";
 
   if (batch_dims && batch_dims->Rank() > 0) {
     main_function_body << "let batchIndices = " << batch_dims->OffsetToIndices("u32(batch)") << ";\n";
   }
 
   main_function_body
-      << "let globalRowStart = i32(workgroupId.y) * " << tile_a_outer << ";\n\n"
+      << "let globalRowStart = i32(workgroup_id.y) * " << tile_a_outer << ";\n\n"
       << "let num_tiles = (uniforms.dim_inner - 1) / tileInner + 1;\n"
       << "var kStart = 0;\n\n"
-      << "var acc: array<vec4<input_value_t>, rowPerThreadB>;\n\n"
+      << "var acc: array<vec4<" << input_value_type << ">, rowPerThreadB>;\n\n"
       << "let tileRowB = localRow * " << row_per_thread_b << ";\n";
 
   // Generate tile loading and computation loops
@@ -910,6 +911,7 @@ void GenerateMatMulPackedCode(OStringStream& additional_implementation,
                               OStringStream& main_function_body,
                               const ShaderIndicesHelper* batch_dims,
                               const std::array<uint32_t, 3>& workgroup_size,
+                              const std::string& input_value_type,
                               const std::array<uint32_t, 3>& elements_per_thread,
                               uint32_t tile_inner, const bool kTransposeA) {
   const uint32_t tile_a_outer = workgroup_size[1] * elements_per_thread[1];
@@ -922,23 +924,23 @@ void GenerateMatMulPackedCode(OStringStream& additional_implementation,
 
   // Generate workgroup shared memory declarations
   additional_implementation
-      << "var<workgroup> mm_Asub: array<array<" << "input_value_t" << ", " << tile_a_width << ">, " << tile_a_height << ">;\n"
-      << "var<workgroup> mm_Bsub: array<array<" << "input_value_t" << ", " << tile_b_outer << ">, " << tile_inner << ">;\n"
+      << "var<workgroup> mm_Asub: array<array<" << input_value_type << ", " << tile_a_width << ">, " << tile_a_height << ">;\n"
+      << "var<workgroup> mm_Bsub: array<array<" << input_value_type << ", " << tile_b_outer << ">, " << tile_inner << ">;\n"
       << "const rowPerThread = " << elements_per_thread[1] << ";\n"
       << "const colPerThread = " << elements_per_thread[0] << ";\n"
       << "const tileInner = " << tile_inner << ";\n\n";
 
   // Generate main computation
   main_function_body
-      << "let tileRow = i32(localId.y) * rowPerThread;\n"
-      << "let tileCol = i32(localId.x) * colPerThread;\n\n"
-      << "let globalRow = i32(globalId.y) * rowPerThread;\n"
-      << "let globalCol = i32(globalId.x) * colPerThread;\n"
-      << "let globalRowStart = i32(workgroupId.y) * " << tile_a_outer << ";\n\n"
-      << "let tileRowA = i32(localId.y) * " << row_per_thread_a << ";\n"
-      << "let tileColA = i32(localId.x) * " << col_per_thread_a << ";\n"
-      << "let tileRowB = i32(localId.y) * " << row_per_thread_b << ";\n\n"
-      << "let batch = i32(globalId.z);\n";
+      << "let tileRow = i32(local_id.y) * rowPerThread;\n"
+      << "let tileCol = i32(local_id.x) * colPerThread;\n\n"
+      << "let globalRow = i32(global_id.y) * rowPerThread;\n"
+      << "let globalCol = i32(global_id.x) * colPerThread;\n"
+      << "let globalRowStart = i32(workgroup_id.y) * " << tile_a_outer << ";\n\n"
+      << "let tileRowA = i32(local_id.y) * " << row_per_thread_a << ";\n"
+      << "let tileColA = i32(local_id.x) * " << col_per_thread_a << ";\n"
+      << "let tileRowB = i32(local_id.y) * " << row_per_thread_b << ";\n\n"
+      << "let batch = i32(global_id.z);\n";
 
   if (batch_dims && batch_dims->Rank() > 0) {
     main_function_body << "let batchIndices = " << batch_dims->OffsetToIndices("u32(batch)") << ";\n";
@@ -947,7 +949,7 @@ void GenerateMatMulPackedCode(OStringStream& additional_implementation,
   main_function_body
       << "let num_tiles = (uniforms.dim_inner - 1) / tileInner + 1;\n"
       << "var kStart = 0;\n\n"
-      << "var acc: array<array<" << "input_value_t" << ", " << elements_per_thread[0] << ">, "
+      << "var acc: array<array<" << input_value_type << ", " << elements_per_thread[0] << ">, "
       << elements_per_thread[1] << ">;\n\n";
 
   // Generate standard matmul loop
@@ -972,7 +974,7 @@ void GenerateMatMulPackedCode(OStringStream& additional_implementation,
       << "  kStart = kStart + tileInner;\n"
       << "  workgroupBarrier();\n\n"
       // Compute accumulation
-      << "  var BCached: array<" << "input_value_t" << ", " << elements_per_thread[0] << ">;\n"
+      << "  var BCached: array<" << input_value_type << ", " << elements_per_thread[0] << ">;\n"
       << "  for (var k = 0; k < tileInner; k = k + 1) {\n"
       << "    for (var inner = 0; inner < colPerThread; inner = inner + 1) {\n"
       << "      BCached[inner] = mm_Bsub[k][tileCol + inner];\n"
@@ -1746,6 +1748,7 @@ Status MatmulProgram::GenerateShaderCode(ShaderHelper& shader) const {
                                  shader.MainFunctionBody(),
                                  &batch_dims,
                                  attributes_.workgroup_size,
+                                 "a_value_t",
                                  attributes_.elements_per_thread,
                                  kTileInner);
   } else {
@@ -1754,6 +1757,7 @@ Status MatmulProgram::GenerateShaderCode(ShaderHelper& shader) const {
                              shader.MainFunctionBody(),
                              &batch_dims,
                              attributes_.workgroup_size,
+                             "a_value_t",
                              attributes_.elements_per_thread,
                              kTileInner, kTransposeA);
   }
@@ -1900,6 +1904,7 @@ Status Conv2DMatMulProgram::GenerateShaderCode(ShaderHelper& shader) const {
                                  shader.MainFunctionBody(),
                                  nullptr,
                                  attributes_.workgroup_size,
+                                 "x_value_t",
                                  attributes_.elements_per_thread,
                                  tile_inner);
   } else {
@@ -1907,6 +1912,7 @@ Status Conv2DMatMulProgram::GenerateShaderCode(ShaderHelper& shader) const {
                              shader.MainFunctionBody(),
                              nullptr,
                              attributes_.workgroup_size,
+                             "x_value_t",
                              attributes_.elements_per_thread,
                              tile_inner,
                              false);  // kTransposeA = false
@@ -1982,7 +1988,7 @@ std::string Conv2DMatMulProgram::GenerateConv2DCommonSnippet(
   // Build read_x_snippet
   std::stringstream read_x;
   read_x << "let inChannels = i32(uniforms.w_shape[2]);\n"
-         << "let outWidth = " << (is_channels_last ? "i32(uniforms.result_shape[2])" : "i32(uniforms.result_shape[3])") << ";\n"
+         << "let outWidth = " << (is_channels_last ? "i32(uniforms.output_shape[2])" : "i32(uniforms.output_shape[3])") << ";\n"
          << "let outRow = " << row << " / outWidth;\n"
          << "let outCol = " << row << " % outWidth;\n\n"
          << "let WRow = " << col << " / (i32(uniforms.w_shape[1]) * inChannels);\n"
@@ -2039,7 +2045,7 @@ std::string Conv2DMatMulProgram::GenerateConv2DCommonSnippet(
        << "  let col = colIn * " << inner_element_size << ";\n"
        << "  if (row < uniforms.dim_a_outer && col < uniforms.dim_b_outer) {\n"
        << "    var value = valueIn;\n"
-       << "    let outWidth = " << (is_channels_last ? "i32(uniforms.result_shape[2])" : "i32(uniforms.result_shape[3])") << ";\n"
+       << "    let outWidth = " << (is_channels_last ? "i32(uniforms.output_shape[2])" : "i32(uniforms.output_shape[3])") << ";\n"
        << "    " << coord_res_snippet << "\n";
 
   if (add_bias) {
