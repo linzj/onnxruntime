@@ -112,10 +112,22 @@ Status DepthToSpace::ComputeInternal(ComputeContext& context) const {
   CalculateShapeAndPerm(input_shape, reshaped_shape, perm);
 
   // Calculate output shape
+  std::vector<int64_t> output_shape(4);
+  const auto& dims = input_shape.GetDims();
+  const int64_t blocksize = attributes_.blocksize;
+
   int components;
   if (attributes_.nchw) {
+    output_shape[0] = dims[0];                            // N
+    output_shape[1] = dims[1] / (blocksize * blocksize);  // C
+    output_shape[2] = dims[2] * blocksize;                // H
+    output_shape[3] = dims[3] * blocksize;                // W
     components = 1;
   } else {
+    output_shape[0] = dims[0];                            // N
+    output_shape[1] = dims[1] * blocksize;                // H
+    output_shape[2] = dims[2] * blocksize;                // W
+    output_shape[3] = dims[3] / (blocksize * blocksize);  // C
     components = 4;
   }
 
@@ -129,10 +141,11 @@ Status DepthToSpace::ComputeInternal(ComputeContext& context) const {
   program->attributes_.shape = reshaped_shape;
   program->attributes_.perm = perm;
   program->attributes_.input_dims = std::vector<int64_t>(input_shape.GetDims().begin(), input_shape.GetDims().end());
+  auto* output = context.Output(0, TensorShape(output_shape));
 
   // Configure inputs/outputs
   program->AddInputs({{input_tensor, ProgramTensorMetadataDependency::TypeAndRank, TensorShape(reshaped_shape), components}});
-  program->AddOutput({context.Output(0, TensorShape(reshaped_shape)), ProgramTensorMetadataDependency::None});
+  program->AddOutput({output, ProgramTensorMetadataDependency::None, TensorShape(reshaped_shape), components});
 
   // Set dispatch size
   program->SetDispatchGroupSize(
