@@ -413,7 +413,7 @@ Status RunNaiveMatmulProgram(
     const std::vector<const TensorShape>& input_shapes,
     const InternalActivationAttributes& activation_attributes,
     const TensorShapeVector& output_shape,
-    const TensorShapeVector& reshaped_output_shape,
+    const TensorShapeVector* reshaped_output_shape,
     bool is_channel_last) {
   // Extract dimensions
   const auto& a_shape = input_shapes[0].GetDims();
@@ -429,10 +429,8 @@ Status RunNaiveMatmulProgram(
   const uint32_t output_number = GetMaxComponents(M);
 
   // Calculate output dimensions
-  std::vector<uint32_t> outer_dims;
-  for (size_t i = 0; i < reshaped_output_shape.size() - 2; ++i) {
-    outer_dims.push_back(static_cast<uint32_t>(reshaped_output_shape[i]));
-  }
+  std::vector<int64_t> outer_dims = !reshaped_output_shape ? std::vector<int64_t>(output_shape.begin(), output_shape.end() - 2) : std::vector<int64_t>(reshaped_output_shape->begin(), reshaped_output_shape->end() - 2);
+
   const int64_t batch_size = std::accumulate(outer_dims.begin(), outer_dims.end(), static_cast<int64_t>(1), std::multiplies<int64_t>());
   const TensorShapeVector output_shape_in_shader{batch_size, M, N};
   const size_t output_size = TensorShape(output_shape).Size() / components / output_number;
@@ -452,8 +450,8 @@ Status RunNaiveMatmulProgram(
   program->attributes_.outputShapeSize = static_cast<uint32_t>(output_shape.size());
 
   // Configure program inputs
-  program->AddInputs({{inputs[0], ProgramTensorMetadataDependency::TypeAndRank, input_shapes[0].AsShapeVector(), static_cast<int>(a_components)}});
-  program->AddInputs({{inputs[1], ProgramTensorMetadataDependency::TypeAndRank, input_shapes[1].AsShapeVector(), static_cast<int>(components)}});
+  program->AddInputs({{inputs[0], ProgramTensorMetadataDependency::TypeAndRank, a_shape, static_cast<int>(a_components)}});
+  program->AddInputs({{inputs[1], ProgramTensorMetadataDependency::TypeAndRank, b_shape, static_cast<int>(components)}});
   if (has_bias) {
     const auto bias_components = is_channel_last ? components : 1;
     program->AddInputs({{inputs[2],
@@ -461,8 +459,7 @@ Status RunNaiveMatmulProgram(
                          input_shapes[2].AsShapeVector(), static_cast<int>(bias_components)}});
   }
   // allocate a Tensor object for outerDims
-  std::vector<int64_t> outer_dims_int64(outer_dims.begin(), outer_dims.end());
-  auto outer_dims_tensor = context.CreateGPUTensor(inputs[0]->DataType(), TensorShape(outer_dims_int64));
+  auto outer_dims_tensor = context.CreateGPUTensor(inputs[0]->DataType(), TensorShape(outer_dims));
   program->AddInputs({{&outer_dims_tensor, ProgramTensorMetadataDependency::TypeAndRank}});
 
   // Configure program outputs
@@ -495,7 +492,7 @@ Status RunMatmulProgram(
     const std::vector<const Tensor*>& inputs,
     const std::vector<const TensorShape>& input_shapes,
     const InternalActivationAttributes& activation_attributes,
-    const TensorShapeVector& output_shape, const TensorShapeVector* reshapedOutputShape, bool is_channels_last) {
+    const TensorShapeVector& output_shape, const TensorShapeVector* reshaped_output_shape, bool is_channels_last) {
   // Calculate shapes and dimensions
   const Tensor* A = inputs[0];
   const Tensor* B = inputs[1];
@@ -515,7 +512,7 @@ Status RunMatmulProgram(
   // Extract outer dimensions and calculate batch size
   std::vector<int64_t> outer_dims_a(a_shape.GetDims().begin(), a_shape.GetDims().end() - 2);
   std::vector<int64_t> outer_dims_b(b_shape.GetDims().begin(), b_shape.GetDims().end() - 2);
-  std::vector<int64_t> outer_dims = !reshapedOutputShape ? std::vector<int64_t>(output_shape.begin(), output_shape.end() - 2) : std::vector<int64_t>(reshapedOutputShape->begin(), reshapedOutputShape->end() - 2);
+  std::vector<int64_t> outer_dims = !reshaped_output_shape ? std::vector<int64_t>(output_shape.begin(), output_shape.end() - 2) : std::vector<int64_t>(reshaped_output_shape->begin(), reshaped_output_shape->end() - 2);
   const int64_t batch_size = std::accumulate(outer_dims.begin(), outer_dims.end(), 1LL, std::multiplies<int64_t>());
 
   // Check if we can use vec4 optimization
@@ -534,10 +531,6 @@ Status RunMatmulProgram(
   b_shape_tmp.push_back(dim_b_outer / components);
 
   std::vector<int64_t> output_shape_tmp{batch_size, dim_a_outer, dim_b_outer / components};
-
-  // Create TensorShape objects
-  TensorShape a_shape_tensor(a_shape_tmp);
-  TensorShape b_shape_tensor(b_shape_tmp);
 
   // Setup MatmulProgram attributes
   auto program = std::make_unique<MatmulProgram>();
@@ -562,6 +555,10 @@ Status RunMatmulProgram(
   program->attributes_.a_shape = to_uint32_vector(a_shape);
   program->attributes_.b_shape = to_uint32_vector(b_shape);
 
+  // Create TensorShape objects
+  TensorShape a_shape_tensor(a_shape_tmp);
+  TensorShape b_shape_tensor(b_shape_tmp);
+
   // Configure program inputs/outputs
   program->AddInputs({{A, ProgramTensorMetadataDependency::TypeAndRank, a_shape_tensor, static_cast<int>(components)}});
   program->AddInputs({{B, ProgramTensorMetadataDependency::TypeAndRank, b_shape_tensor, static_cast<int>(components)}});
@@ -570,8 +567,7 @@ Status RunMatmulProgram(
     program->AddInputs({{bias, ProgramTensorMetadataDependency::TypeAndRank, input_shapes[2].GetDims(), static_cast<int>(biasComponents)}});
   }
   // allocate a Tensor object for outerDims
-  std::vector<int64_t> outer_dims_int64(outer_dims.begin(), outer_dims.end());
-  auto outer_dims_tensor = context.CreateGPUTensor(A->DataType(), TensorShape(outer_dims_int64));
+  auto outer_dims_tensor = context.CreateGPUTensor(A->DataType(), TensorShape(outer_dims));
   program->AddInputs({{&outer_dims_tensor, ProgramTensorMetadataDependency::TypeAndRank, 1}});
 
   program->AddOutput({context.Output(0, output_shape), ProgramTensorMetadataDependency::None, TensorShape(output_shape_tmp), static_cast<int>(components)});
@@ -1317,7 +1313,7 @@ Status Conv::HandleConv2D(ComputeContext& context, const ConvAttributes& attribu
     const int64_t K = mat_mul_input_shapes[0].GetDims().back();
     if (N < 8 && K < 8) {
       ORT_RETURN_IF_ERROR(RunNaiveMatmulProgram(
-          context, mat_mul_inputs, mat_mul_input_shapes, attributes, output_shape, mat_mul_output_shape, is_channels_last));
+          context, mat_mul_inputs, mat_mul_input_shapes, attributes, output_shape, &mat_mul_output_shape, is_channels_last));
       return Status::OK();
     } else {
       ORT_RETURN_IF_ERROR(RunMatmulProgram(context, mat_mul_inputs, mat_mul_input_shapes, attributes, output_shape, &mat_mul_output_shape, is_channels_last));
