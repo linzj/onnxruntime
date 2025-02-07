@@ -668,6 +668,7 @@ Status RunConv2DMatMulProgram(
   program->attributes_.elements_per_thread = elements_per_thread;
   program->attributes_.workgroup_size = workgroup_size;
   program->attributes_.in_channels = input_channels;                      // Set channels
+  program->attributes_.out_channels = out_channels;                       // Set channels
   program->attributes_.dim_a_outer = static_cast<uint32_t>(dim_a_outer);  // Set dim_a_outer
   program->attributes_.dim_b_outer = static_cast<uint32_t>(dim_b_outer);  // Set dim_a_outer
   program->attributes_.dim_inner = static_cast<uint32_t>(dim_inner);      // Set dim_inner
@@ -1841,7 +1842,9 @@ Status Conv2DMatMulProgram::GenerateShaderCode(ShaderHelper& shader) const {
   }
 
   // Calculate sizes and dimensions
-  const bool is_vec4 = attributes_.components == 4;
+  const bool is_vec4 = attributes_.is_channels_last &&
+                       ((attributes_.in_channels % 4 == 0) || (attributes_.in_channels % 3 == 0)) &&
+                       (attributes_.out_channels % 4 == 0);
   const uint32_t inner_element_size = is_vec4 ? (attributes_.is_channels_last && attributes_.in_channels % 4 != 0 ? 3 : 4) : 1;
 
   const uint32_t tile_a_outer = attributes_.workgroup_size[1] * attributes_.elements_per_thread[1];

@@ -195,6 +195,7 @@ class Conv2DMatMulProgram : public Program<Conv2DMatMulProgram> {
     std::array<uint32_t, 3> elements_per_thread;  // [4,4,1] or [4,1,1]
     std::array<uint32_t, 3> workgroup_size;       // [8,8,1]
     uint32_t in_channels;
+    uint32_t out_channels;
     uint32_t dim_a_outer;
     uint32_t dim_b_outer;
     uint32_t dim_inner;
