@@ -840,12 +840,13 @@ void GenerateMatMulPackedVec4Code(OStringStream& additional_implementation,
                                   const std::array<uint32_t, 3>& workgroup_size,
                                   const std::string& input_value_type,
                                   const std::array<uint32_t, 3>& elements_per_thread,
-                                  uint32_t inner_element_size) {
+                                  uint32_t tile_inner, const bool kTransposeA) {
   const uint32_t tile_a_outer = workgroup_size[1] * elements_per_thread[1];
   const uint32_t tile_b_outer = workgroup_size[0] * elements_per_thread[0];
-  const uint32_t tile_a_width = tile_a_outer;
-  const uint32_t tile_a_height = inner_element_size;
-  const uint32_t row_per_thread_b = inner_element_size / workgroup_size[1];
+  const uint32_t tile_a_width = kTransposeA ? tile_a_outer : tile_inner;
+  const uint32_t tile_a_height = kTransposeA ? tile_inner : tile_a_outer;
+  const uint32_t inner_element_size = tile_a_width / workgroup_size[0];
+  const uint32_t row_per_thread_b = tile_inner / workgroup_size[1];
 
   // Generate workgroup shared memory declarations
   additional_implementation
@@ -884,7 +885,7 @@ void GenerateMatMulPackedVec4Code(OStringStream& additional_implementation,
       << "    for (var innerRow = 0; innerRow < rowPerThread; innerRow = innerRow + 1) {\n"
       << "        let inputRow = tileRow + innerRow;\n"
       << "        let inputCol = tileCol;\n"
-      << WriteDataToSubAVec4SnippetImpl(false, batch_dims) << "\n"
+      << WriteDataToSubAVec4SnippetImpl(kTransposeA, batch_dims) << "\n"
       << "    }\n\n"
       << "    for (var innerRow = 0; innerRow < " << row_per_thread_b << "; innerRow = innerRow + 1) {\n"
       << "        let inputRow = tileRowB + innerRow;\n"
@@ -1729,10 +1730,9 @@ Status MatmulProgram::GenerateShaderCode(ShaderHelper& shader) const {
                                                             ShaderUsage::UseOffsetToIndices);
 
   std::vector<const ShaderVariableHelper*> inputs = {&batch_dims, &a, &b, &output};
-  const bool is_vec4 = attributes_.components == 4;
+  const bool is_vec4 = attributes_.dim_inner % 4 == 0 && attributes_.dim_b_outer % 4 == 0;
   std::string workgroup_decl;
   std::string main_code;
-  constexpr const bool kTransposeA = false;
   constexpr const uint32_t kTileInner = 32;
   shader.AdditionalImplementation() << GenerateMatMulReadWriteFnSource(inputs);
   if (is_vec4) {
@@ -1743,7 +1743,7 @@ Status MatmulProgram::GenerateShaderCode(ShaderHelper& shader) const {
                                  attributes_.workgroup_size,
                                  "a_value_t",
                                  attributes_.elements_per_thread,
-                                 kTileInner);
+                                 kTileInner, false);
   } else {
     // For standard implementation
     GenerateMatMulPackedCode(shader.AdditionalImplementation(),
@@ -1752,7 +1752,7 @@ Status MatmulProgram::GenerateShaderCode(ShaderHelper& shader) const {
                              attributes_.workgroup_size,
                              "a_value_t",
                              attributes_.elements_per_thread,
-                             kTileInner, kTransposeA);
+                             kTileInner, false);
   }
 
   return Status::OK();
@@ -1901,7 +1901,7 @@ Status Conv2DMatMulProgram::GenerateShaderCode(ShaderHelper& shader) const {
                                  attributes_.workgroup_size,
                                  "x_value_t",
                                  attributes_.elements_per_thread,
-                                 tile_inner);
+                                 tile_inner, !attributes_.is_channels_last);
   } else {
     GenerateMatMulPackedCode(shader.AdditionalImplementation(),
                              shader.MainFunctionBody(),
@@ -1910,7 +1910,7 @@ Status Conv2DMatMulProgram::GenerateShaderCode(ShaderHelper& shader) const {
                              "x_value_t",
                              attributes_.elements_per_thread,
                              tile_inner,
-                             false);  // kTransposeA = false
+                             !attributes_.is_channels_last);
   }
 
   return Status::OK();
