@@ -149,11 +149,15 @@ Status DepthToSpace::ComputeInternal(ComputeContext& context) const {
 
   // Set dispatch size
   program->SetDispatchGroupSize(
-      static_cast<uint32_t>((TensorShape(reshaped_shape).Size() + 63) / 64)  // Workgroup size of 64
+      static_cast<uint32_t>((TensorShape(output_shape).Size() + 63) / 64)  // Workgroup size of 64
   );
 
   // Add uniform variables
   program->AddUniformVariables({{static_cast<uint32_t>(TensorShape(reshaped_shape).Size())}});
+
+  // Cache the program
+  program->CacheHint(absl::StrJoin(
+      {std::to_string(blocksize), attributes_.mode, (attributes_.nchw ? "NCHW" : "NHWC")}, ";"));
 
   // Run the program
   return context.RunProgram(*program);
