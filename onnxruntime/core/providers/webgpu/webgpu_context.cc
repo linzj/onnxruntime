@@ -4,6 +4,10 @@
 #include <memory>
 #include <cmath>
 
+#if !defined(NDEBUG)
+#include <fstream>
+#endif
+
 #include "dawn/dawn_proc.h"
 #if !defined(USE_EXTERNAL_DAWN)
 #include "dawn/native/DawnNative.h"
@@ -24,6 +28,135 @@
 
 namespace onnxruntime {
 namespace webgpu {
+#if !defined(NDEBUG)
+bool should_capture_output_next = false;
+namespace {
+void SaveBuffer(const wgpu::Device& device, const wgpu::Instance& instance,
+                const wgpu::Buffer& source_buffer, std::string_view file_name) {
+  // 创建临时缓冲区用于映射
+  wgpu::BufferDescriptor temp_buffer_desc;
+  temp_buffer_desc.label = (std::string("TempDownloadBuffer") + file_name.data()).c_str();
+  temp_buffer_desc.size = source_buffer.GetSize();
+  temp_buffer_desc.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead;
+  wgpu::Buffer temp_buffer = device.CreateBuffer(&temp_buffer_desc);
+
+  // 创建命令编码器并复制数据
+  wgpu::CommandEncoder encoder = device.CreateCommandEncoder();
+  encoder.CopyBufferToBuffer(source_buffer, 0, temp_buffer, 0, source_buffer.GetSize());
+  wgpu::CommandBuffer commands = encoder.Finish();
+
+  // 提交命令并等待完成
+  auto queue = device.GetQueue();
+  queue.Submit(1, &commands);
+
+  auto wait_lambda = [](wgpu::QueueWorkDoneStatus status) {
+    if (status != wgpu::QueueWorkDoneStatus::Success) {
+      ORT_THROW("GPU queue work done error during buffer save");
+    }
+  };
+  instance.WaitAny(queue.OnSubmittedWorkDone(wgpu::CallbackMode::WaitAnyOnly, wait_lambda), UINT64_MAX);
+
+  // 映射临时缓冲区
+  instance.WaitAny(temp_buffer.MapAsync(wgpu::MapMode::Read, 0, temp_buffer.GetSize(),
+                                        wgpu::CallbackMode::WaitAnyOnly,
+                                        [](wgpu::MapAsyncStatus status, wgpu::StringView message) {
+                                          if (status != wgpu::MapAsyncStatus::Success) {
+                                            ORT_THROW("Failed to map buffer: ", std::string_view{message});
+                                          }
+                                        }),
+                   UINT64_MAX);
+
+  // 写入文件
+  const void* data = temp_buffer.GetConstMappedRange(0, temp_buffer.GetSize());
+  std::ofstream file(file_name.data(), std::ios::binary);
+  if (!file.is_open()) {
+    ORT_THROW("Failed to open file for writing: ", file_name);
+  }
+  file.write(reinterpret_cast<const char*>(data), temp_buffer.GetSize());
+  temp_buffer.Unmap();
+}
+
+void DownloadOutputDatas(const wgpu::Instance& instance, const wgpu::Device& device,
+                         const std::vector<ProgramOutput>& outputs, std::string_view program_name) {
+  const char* temp_dir = getenv("TMPDIR");
+  std::string base_path = temp_dir ? std::string(temp_dir) + "/" : "";
+
+  int output_index = 0;
+  for (const auto& output : outputs) {
+    if (!output.tensor->IsDataType<float>()) {
+      ORT_THROW("Unsupported data type for output tensor: ", output.tensor->DataType());
+    }
+
+    // 获取源缓冲区
+    WGPUBuffer source = reinterpret_cast<WGPUBuffer>(output.tensor->MutableDataRaw());
+    wgpu::Buffer source_buffer = wgpu::Buffer::Acquire(source);
+
+    // 生成文件名并保存
+    std::stringstream ss;
+    const auto& shape = output.tensor->Shape();
+    for (size_t i = 0; i < shape.NumDimensions(); ++i) {
+      if (i > 0)
+        ss << "x";
+      ss << shape[i];
+    }
+    std::string dims = ss.str();
+    std::string file_name = base_path + std::string(program_name) +
+                            "_output_" + std::to_string(output_index++) +
+                            "_" + dims + ".bin";
+    SaveBuffer(device, instance, source_buffer, file_name);
+  }
+}
+
+void DownloadInputDatas(const wgpu::Instance& instance, const wgpu::Device& device,
+                        const std::vector<ProgramInput>& inputs, std::string_view program_name) {
+  const char* temp_dir = getenv("TMPDIR");
+  std::string base_path = temp_dir ? std::string(temp_dir) + "/" : "";
+
+  int input_index = 0;
+  for (const auto& input : inputs) {
+    if (!input.tensor->IsDataType<float>()) {
+      ORT_THROW("Unsupported data type for input tensor: ", input.tensor->DataType());
+    }
+
+    // 获取源缓冲区（注意使用const数据访问）
+    WGPUBuffer source = reinterpret_cast<WGPUBuffer>(const_cast<void*>(input.tensor->DataRaw()));
+    wgpu::Buffer source_buffer = wgpu::Buffer::Acquire(source);
+
+    // 生成文件名并保存
+    std::stringstream ss;
+    const auto& shape = input.tensor->Shape();
+    for (size_t i = 0; i < shape.NumDimensions(); ++i) {
+      if (i > 0)
+        ss << "x";
+      ss << shape[i];
+    }
+    std::string dims = ss.str();
+    std::string file_name = base_path + std::string(program_name) +
+                            "_input_" + std::to_string(input_index++) +
+                            "_" + dims + ".bin";
+    SaveBuffer(device, instance, source_buffer, file_name);
+  }
+}
+
+void DownloadUniformBuffer(const wgpu::Instance& instance, const wgpu::Device& device,
+                           const wgpu::Buffer& uniform_buffer, std::string_view program_name) {
+  // 检查缓冲区是否有效
+  if (!uniform_buffer) {
+    ORT_THROW("Invalid uniform buffer provided");
+  }
+
+  // 获取临时目录路径
+  const char* temp_dir = getenv("TMPDIR");
+  std::string base_path = temp_dir ? std::string(temp_dir) + "/" : "";
+
+  // 生成文件名
+  std::string file_name = base_path + std::string(program_name) + "_uniform.bin";
+
+  // 调用 SaveBuffer 保存缓冲区
+  SaveBuffer(device, instance, uniform_buffer, file_name);
+}
+}  // namespace
+#endif
 
 void WebGpuContext::Initialize(const WebGpuBufferCacheConfig& buffer_cache_config, int backend_type) {
   std::call_once(init_flag_, [this, &buffer_cache_config, backend_type]() {
@@ -360,12 +493,15 @@ Status WebGpuContext::Run(ComputeContext& context, const ProgramBase& program) {
   WGPUBuffer uniform_buffer = nullptr;
   if (uniform_buffer_total_size > 0) {
     std::vector<uint8_t> uniform_data_buffer(uniform_buffer_total_size);
-
     for (auto const& [uniform, offset] : uniform_and_offsets) {
       memcpy(uniform_data_buffer.data() + offset, uniform.data.data(), uniform.data.size());
     }
 
+#if defined(NDEBUG)
     uniform_buffer = buffer_mgr_->Create(uniform_buffer_total_size, wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::Uniform);
+#else
+    uniform_buffer = buffer_mgr_->Create(uniform_buffer_total_size, wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopySrc);
+#endif
     device_.GetQueue().WriteBuffer(uniform_buffer, 0, uniform_data_buffer.data(), uniform_buffer_total_size);
   }
 
@@ -398,6 +534,16 @@ Status WebGpuContext::Run(ComputeContext& context, const ProgramBase& program) {
   compute_pass_encoder.SetPipeline(program_artifact->compute_pipeline);
   compute_pass_encoder.SetBindGroup(0, bind_group);
   compute_pass_encoder.DispatchWorkgroups(x, y, z);
+#if !defined(NDEBUG)
+  if (should_capture_output_next) {
+    should_capture_output_next = false;
+    Flush();
+    num_pending_dispatches_ = 0;
+    DownloadInputDatas(instance_, device_, inputs, program.Name());
+    DownloadOutputDatas(instance_, device_, outputs, program.Name());
+    DownloadUniformBuffer(instance_, device_, uniform_buffer, program.Name());
+  }
+#endif
 
   if (uniform_buffer) {
     buffer_mgr_->Release(uniform_buffer);

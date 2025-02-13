@@ -314,7 +314,7 @@ const conv2d = (
 
   // TODO: implement conv2dWithIm2Col()
 
-  const sequentialAccessByThreads = /* backend.adapterInfo.isIntel() */ true;
+  const sequentialAccessByThreads = /* backend.adapterInfo.isIntel() */ false;
 
   // STEP.1: transpose weight
   const transposedWeight =

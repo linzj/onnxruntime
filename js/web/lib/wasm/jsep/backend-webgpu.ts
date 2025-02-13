@@ -198,6 +198,8 @@ export class WebGpuBackend {
    * a KernelID -> a custom data, which stores custom data owned by the specific kernel.
    */
   private kernelCustomData: Map<number, { [key: string]: unknown }>;
+  private shouldDownloadNextBuffer: boolean = false;
+
   /**
    * get the custom data of the current kernel
    */
@@ -576,6 +578,8 @@ export class WebGpuBackend {
     // TODO: add cache for uniform (is it necessary?)
     //
     let uniformBufferBinding: GPUBindingResource | undefined;
+    let uniformArrayBuffer: ArrayBuffer | undefined;
+
     if (programUniforms) {
       let currentOffset = 0;
       const offsets: number[] = [];
@@ -635,6 +639,7 @@ export class WebGpuBackend {
       this.device.queue.writeBuffer(uniformBufferData.buffer, 0, arrayBuffer, 0, currentOffset);
       this.gpuDataManager.release(uniformBufferData.id);
       uniformBufferBinding = { offset: 0, size: currentOffset, buffer: uniformBufferData.buffer };
+      uniformArrayBuffer = arrayBuffer;
     }
 
     const normalizedDispatchGroup = this.programManager.normalizeDispatchGroupSize(dispatchGroup);
@@ -696,6 +701,13 @@ export class WebGpuBackend {
     }
 
     this.programManager.run(artifact, inputDatas, outputDatas, normalizedDispatchGroup, uniformBufferBinding);
+
+    if (this.shouldDownloadNextBuffer) {
+      this.shouldDownloadNextBuffer = false;
+      this.downloadInputs(program, inputTensorViews);
+      this.downloadOutputs(program, outputTensorViews);
+      this.downloadUniforms(program, uniformArrayBuffer!);
+    }
 
     TRACE_FUNC_END(program.name);
     return outputTensorViews;
@@ -949,4 +961,110 @@ export class WebGpuBackend {
     this.currentSessionId = sessionId;
     this.setQueryType();
   }
+
+  async downloadOutputs(program: ProgramInfo, outputTensorViews: TensorView[]): Promise<void> {
+    try {
+      // 第二步：遍历所有输出张量
+      for (let i = 0; i < outputTensorViews.length; i++) {
+        const tensor = outputTensorViews[i];
+
+        // 跳过空张量
+        if (tensor.data === 0) {
+          console.log(`[Skip] 输出 ${i} 是空张量`);
+          continue;
+        }
+
+        // 获取GPU数据
+        const gpuData = this.gpuDataManager.get(tensor.data);
+        if (!gpuData) {
+          console.warn(`[Error] 输出 ${i} 无GPU数据`);
+          continue;
+        }
+        const data = await downloadGpuData(this, gpuData.buffer, gpuData.buffer.size);
+
+        // 生成文件名
+        const fileName = `${program.name}_${i}_${tensor.dims.join('x')}.data`;
+
+        // 创建下载
+        const blob = new Blob([data], { type: 'application/octet-stream' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = fileName;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+
+        // 清理资源
+        URL.revokeObjectURL(url);
+
+        console.log(`[Success] 已下载 ${fileName} (${data.byteLength}字节)`);
+      }
+    } catch (error) {
+      console.error('[Critical Error] 下载失败:', error);
+    }
+  }
+
+  async downloadInputs(program: ProgramInfo, inputTensorViews: readonly TensorView[]): Promise<void> {
+    try {
+      // 遍历所有输入张量
+      for (let i = 0; i < inputTensorViews.length; i++) {
+        const tensor = inputTensorViews[i];
+
+        // 跳过空张量
+        if (tensor.data === 0) {
+          console.log(`[Skip] 输入 ${i} 是空张量`);
+          continue;
+        }
+
+        // 获取GPU数据
+        const gpuData = this.gpuDataManager.get(tensor.data);
+        if (!gpuData) {
+          console.warn(`[Error] 输入 ${i} 无GPU数据`);
+          continue;
+        }
+
+        const data = await downloadGpuData(this, gpuData.buffer, gpuData.buffer.size);
+
+        // 生成文件名（包含内核名称和输入索引）
+        const fileName = `${program.name}_input_${i}_${tensor.dims.join('x')}.data`;
+
+        // 创建下载
+        const blob = new Blob([data], { type: 'application/octet-stream' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = fileName;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+
+        // 清理资源
+        URL.revokeObjectURL(url);
+
+        console.log(`[Success] 已下载输入 ${fileName} (${data.byteLength}字节)`);
+      }
+    } catch (error) {
+      console.error('[Critical Error] 输入下载失败:', error);
+    }
+  }
+
+  private async downloadUniforms(program: ProgramInfo, uniformBufferData: ArrayBuffer): Promise<void> {
+    try {
+      const fileName = `${program.name}_uniform.data`;
+      const blob = new Blob([uniformBufferData], { type: 'application/octet-stream' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      console.log(`[Success] Downloaded uniform ${fileName} (${uniformBufferData.byteLength} bytes)`);
+    } catch (error) {
+      console.error('[Error] Failed to download uniform:', error);
+    }
+  }
+
 }
