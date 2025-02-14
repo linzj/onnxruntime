@@ -72,9 +72,10 @@ class ResizeProgram : public Program<ResizeProgram> {
 
   // Attributes
   ResizeAttributes attributes_;
-  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES({"output_size", ProgramUniformVariableDataType::Uint32},
-                                          {"scales", ProgramUniformVariableDataType::Float32},
-                                          {"roi", ProgramUniformVariableDataType::Float32});
+  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
+      {"output_size", ProgramUniformVariableDataType::Uint32},
+      {"scales", ProgramUniformVariableDataType::Float32},
+      {"roi", ProgramUniformVariableDataType::Float32});
 
   // Helper methods for shader code generation
   static std::string CoordinateTransformModeToWGSL(CoordinateTransformMode mode);

@@ -60,18 +60,18 @@ WEBGPU_RESIZE_VERSIONED_KERNEL(18, 18)
 WEBGPU_RESIZE_KERNEL(19)
 
 namespace {
-Printable SetChannelAndBatchIndices(
+std::string SetChannelAndBatchIndices(
     const ShaderIndicesHelper& input,
     int channel_idx,
     int batch_idx,
     int special_dims) {
-  return Printable([&](std::ostream& code) {
-    if (input.Rank() > special_dims) {
-      // Assuming indicesSet is a function in ShaderIndicesHelper
-      code << input.IndicesSet("input_indices", channel_idx, "channel") << ";\n";
-      code << input.IndicesSet("input_indices", batch_idx, "batch") << ";\n";
-    }
-  });
+  std::ostringstream code;
+  if (input.Rank() > special_dims) {
+    // Assuming indicesSet is a function in ShaderIndicesHelper
+    code << input.IndicesSet("input_indices", channel_idx, "channel") << "\n";
+    code << input.IndicesSet("input_indices", batch_idx, "batch") << "\n";
+  }
+  return code.str();
 }
 
 // Helper functions to convert strings to enums
@@ -189,25 +189,26 @@ std::vector<float> UpdateScales(const std::vector<float>& scales, const gsl::spa
 }
 
 std::vector<float> UpdateRoI(const std::vector<float>& roi, const gsl::span<const int64_t>& axes, size_t rank) {
-  // Create a vector with 'rank' zeros followed by 'rank' ones
-  std::vector<float> roi_tmp(rank * 2);
-  for (size_t i = 0; i < rank; ++i) {
-    roi_tmp[i] = 0.0f;
-    roi_tmp[i + rank] = 1.0f;
+  std::vector<float> roi_local;
+  if (roi.empty()) {
+    roi_local.resize(rank * 2);
+    for (size_t i = 0; i < rank; ++i) {
+      roi_local[i] = 0.0f;
+      roi_local[i + rank] = 1.0f;
+    }
+  } else {
+    roi_local = roi;
   }
-
-  // If roi is empty, use roi_tmp; otherwise, make a copy of roi into roi_local
-  std::vector<float> roi_local = roi.empty() ? roi_tmp : roi;
 
   if (!axes.empty()) {
+    std::vector<float> result = roi_local;
     for (size_t i = 0; i < axes.size(); ++i) {
       int64_t v = axes[i];
-      roi_tmp[v] = roi_local[i];
-      roi_tmp[i + rank] = roi_local[axes.size() + i];
+      result[v] = roi_local[i];
+      result[i + rank] = roi_local[axes.size() + i];
     }
-    return roi_tmp;
+    return result;
   }
-
   return roi_local;
 }
 
@@ -545,45 +546,6 @@ Status ResizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
   }
   additional_impl << "}\n\n";
 
-  // Define getNearestPixelFromOriginal function
-  additional_impl << "fn getNearestPixelFromOriginal(xOriginal: f32, isDownSample: bool) -> f32 {\n";
-  switch (attributes_.nearestMode) {
-    case NearestMode::RoundPreferFloor:
-      additional_impl << "  if (fract(xOriginal) == 0.5) {\n"
-                      << "    return floor(xOriginal);\n"  // Corrected to 'floor' as per user feedback
-                      << "  } else {\n"
-                      << "    return round(xOriginal);\n"
-                      << "  }\n";
-      break;
-    case NearestMode::RoundPreferCeil:
-      additional_impl << "  if (fract(xOriginal) == 0.5) {\n"
-                      << "    return ceil(xOriginal);\n"
-                      << "  } else {\n"
-                      << "    return round(xOriginal);\n"
-                      << "  }\n";
-      break;
-    case NearestMode::Floor:
-      additional_impl << "  return floor(xOriginal);\n";
-      break;
-    case NearestMode::Ceil:
-      additional_impl << "  return ceil(xOriginal);\n";
-      break;
-    case NearestMode::Simple:
-      if (attributes_.opset < 11) {
-        additional_impl << "  if (isDownSample) {\n"
-                        << "    return ceil(xOriginal);\n"
-                        << "  } else {\n"
-                        << "    return xOriginal;\n"
-                        << "  }\n";
-      } else {
-        return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Nearest mode 'simple' not supported for opset >= 11.");
-      }
-      break;
-    default:
-      return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Unsupported NearestMode in shader generation.");
-  }
-  additional_impl << "}\n\n";
-
   // Define calculateOriginalIndicesFromOutputIndices function
   size_t output_shape_length = attributes_.output_shape.NumDimensions();
   size_t input_shape_length = attributes_.input_shape.NumDimensions();
@@ -608,50 +570,6 @@ Status ResizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
                   << "  }\n"
                   << "  return original_indices;\n"
                   << "}\n";
-
-  // Define calculateInputIndicesFromOutputIndices function
-  additional_impl << "fn calculateInputIndicesFromOutputIndices(output_indices: output_indices_t) -> input_indices_t {\n"
-                  << "  var input_indices: input_indices_t;\n"
-                  << "  for (var i: u32 = 0u; i < " << output_shape_length << "; i++) {\n"
-                  << "    var output_index = " << output.IndicesGet("output_indices", "i") << ";\n"
-                  << "    var input_index: u32;\n"
-                  << "    var scale = " << GetElementAt("uniforms.scales", "i", attributes_.scales.size()) << ";\n"
-                  << "    if (scale == 1.0) {" << "\n"
-                  << "      input_index = output_index;\n"
-                  << "    } else {\n"
-                  << "      var roi_low = " << GetElementAt("uniforms.roi", "i", attributes_.roi.size()) << ";\n"
-                  << "      var roi_hi = " << GetElementAt("uniforms.roi", MakeString("i + ", input_shape_length), attributes_.roi.size()) << ";\n"
-                  << "      var input_shape_i = " << GetElementAt("uniforms.input_shape", "i", input_shape_length) << ";\n"
-                  << "      var output_shape_i = " << GetElementAt("uniforms.output_shape", "i", output_shape_length) << ";\n"
-                  << "      var original_idx = getOriginalCoordinateFromResizedCoordinate(output_index, scale, output_shape_i," << "\n"
-                  << "                                                                    input_shape_i, roi_low, roi_hi);\n"
-                  << "      if (!" << (use_extrapolation ? "true" : "false") << " || (original_idx >= 0 && original_idx < output_value_t(input_shape_i))) {\n"
-                  << "        if (original_idx < 0) {\n"
-                  << "          input_index = 0;\n"
-                  << "        } else if (original_idx > output_value_t(input_shape_i - 1)) {\n"
-                  << "          input_index = input_shape_i - 1;\n"
-                  << "        } else {\n"
-                  << "          input_index = u32(getNearestPixelFromOriginal(original_idx, scale < 1));\n"
-                  << "        }\n"
-                  << "      } else {\n"
-                  << "        input_index = u32(original_idx);\n"
-                  << "      }\n"
-                  << "    }\n"
-                  << "    " << input.IndicesSet("input_indices", "i", "input_index") << ";\n"
-                  << "  }\n"
-                  << "  return input_indices;\n"
-                  << "}\n\n";
-
-  // Define checkInputIndices function
-  additional_impl << "fn checkInputIndices(input_indices: input_indices_t) -> bool {\n"
-                  << "  for (var i: u32 = 0u; i < " << output_shape_length << "u; i = i + 1u) {\n"
-                  << "  var input_index = " << input.IndicesGet("input_indices", "i") << ";\n"
-                  << "  if (input_index < 0 || input_index >= " << GetElementAt("uniforms.input_shape", "i", input_shape_length) << ") {\n"
-                  << "    return false;\n"
-                  << "  }\n"
-                  << "}\n"
-                  << "return true;\n"
-                  << "}\n\n";
 
   // Define interpolation functions based on mode
   if (attributes_.mode == Mode::Linear) {
@@ -889,6 +807,89 @@ Status ResizeProgram::GenerateShaderCode(ShaderHelper& shader) const {
               << "  var input_indices: input_indices_t;\n";
 
     if (attributes_.mode == Mode::Nearest) {
+      // Define getNearestPixelFromOriginal function
+      additional_impl << "fn getNearestPixelFromOriginal(xOriginal: f32, isDownSample: bool) -> f32 {\n";
+      switch (attributes_.nearestMode) {
+        case NearestMode::RoundPreferFloor:
+          additional_impl << "  if (fract(xOriginal) == 0.5) {\n"
+                          << "    return floor(xOriginal);\n"  // Corrected to 'floor' as per user feedback
+                          << "  } else {\n"
+                          << "    return round(xOriginal);\n"
+                          << "  }\n";
+          break;
+        case NearestMode::RoundPreferCeil:
+          additional_impl << "  if (fract(xOriginal) == 0.5) {\n"
+                          << "    return ceil(xOriginal);\n"
+                          << "  } else {\n"
+                          << "    return round(xOriginal);\n"
+                          << "  }\n";
+          break;
+        case NearestMode::Floor:
+          additional_impl << "  return floor(xOriginal);\n";
+          break;
+        case NearestMode::Ceil:
+          additional_impl << "  return ceil(xOriginal);\n";
+          break;
+        case NearestMode::Simple:
+          if (attributes_.opset < 11) {
+            additional_impl << "  if (isDownSample) {\n"
+                            << "    return ceil(xOriginal);\n"
+                            << "  } else {\n"
+                            << "    return xOriginal;\n"
+                            << "  }\n";
+          } else {
+            return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Nearest mode 'simple' not supported for opset >= 11.");
+          }
+          break;
+        default:
+          return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Unsupported NearestMode in shader generation.");
+      }
+      additional_impl << "}\n\n";
+
+      // Define calculateInputIndicesFromOutputIndices function
+      additional_impl << "fn calculateInputIndicesFromOutputIndices(output_indices: output_indices_t) -> input_indices_t {\n"
+                      << "  var input_indices: input_indices_t;\n"
+                      << "  for (var i: u32 = 0u; i < " << output_shape_length << "; i++) {\n"
+                      << "    var output_index = " << output.IndicesGet("output_indices", "i") << ";\n"
+                      << "    var input_index: u32;\n"
+                      << "    var scale = " << GetElementAt("uniforms.scales", "i", attributes_.scales.size()) << ";\n"
+                      << "    if (scale == 1.0) {" << "\n"
+                      << "      input_index = output_index;\n"
+                      << "    } else {\n"
+                      << "      var roi_low = " << GetElementAt("uniforms.roi", "i", attributes_.roi.size()) << ";\n"
+                      << "      var roi_hi = " << GetElementAt("uniforms.roi", MakeString("i + ", input_shape_length), attributes_.roi.size()) << ";\n"
+                      << "      var input_shape_i = " << GetElementAt("uniforms.input_shape", "i", input_shape_length) << ";\n"
+                      << "      var output_shape_i = " << GetElementAt("uniforms.output_shape", "i", output_shape_length) << ";\n"
+                      << "      var original_idx = getOriginalCoordinateFromResizedCoordinate(output_index, scale, output_shape_i," << "\n"
+                      << "                                                                    input_shape_i, roi_low, roi_hi);\n"
+                      << "      if (!" << (use_extrapolation ? "true" : "false") << " || (original_idx >= 0 && original_idx < output_value_t(input_shape_i))) {\n"
+                      << "        if (original_idx < 0) {\n"
+                      << "          input_index = 0;\n"
+                      << "        } else if (original_idx > output_value_t(input_shape_i - 1)) {\n"
+                      << "          input_index = input_shape_i - 1;\n"
+                      << "        } else {\n"
+                      << "          input_index = u32(getNearestPixelFromOriginal(original_idx, scale < 1));\n"
+                      << "        }\n"
+                      << "      } else {\n"
+                      << "        input_index = u32(original_idx);\n"
+                      << "      }\n"
+                      << "    }\n"
+                      << "    " << input.IndicesSet("input_indices", "i", "input_index") << ";\n"
+                      << "  }\n"
+                      << "  return input_indices;\n"
+                      << "}\n\n";
+
+      // Define checkInputIndices function
+      additional_impl << "fn checkInputIndices(input_indices: input_indices_t) -> bool {\n"
+                      << "  for (var i: u32 = 0u; i < " << output_shape_length << "u; i = i + 1u) {\n"
+                      << "  var input_index = " << input.IndicesGet("input_indices", "i") << ";\n"
+                      << "  if (input_index < 0 || input_index >= " << GetElementAt("uniforms.input_shape", "i", input_shape_length) << ") {\n"
+                      << "    return false;\n"
+                      << "  }\n"
+                      << "}\n"
+                      << "return true;\n"
+                      << "}\n\n";
+
       main_body << "input_indices = calculateInputIndicesFromOutputIndices(output_indices);\n"
                 << "  if (checkInputIndices(input_indices)) {\n"
                 << "    output[global_idx] = " << input.GetByIndices("input_indices") << ";\n"
