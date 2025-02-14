@@ -189,16 +189,23 @@ std::vector<float> UpdateScales(const std::vector<float>& scales, const gsl::spa
 }
 
 std::vector<float> UpdateRoI(const std::vector<float>& roi, const gsl::span<const int64_t>& axes, size_t rank) {
-  std::vector<float> roi_temp(rank * 2, 0);                     // Create a vector with 'rank' 0's followed by 'rank' 1's
-  std::vector<float> roi_local = roi.empty() ? roi_temp : roi;  // If roi is empty, use roiTmp, otherwise copy roi
+  // Create a vector with 'rank' zeros followed by 'rank' ones
+  std::vector<float> roi_tmp(rank * 2);
+  for (size_t i = 0; i < rank; ++i) {
+    roi_tmp[i] = 0.0f;
+    roi_tmp[i + rank] = 1.0f;
+  }
+
+  // If roi is empty, use roi_tmp; otherwise, make a copy of roi into roi_local
+  std::vector<float> roi_local = roi.empty() ? roi_tmp : roi;
 
   if (!axes.empty()) {
     for (size_t i = 0; i < axes.size(); ++i) {
       int64_t v = axes[i];
-      roi_temp[v] = roi_local[i];
-      roi_temp[i + rank] = roi_local[axes.size() + i];
+      roi_tmp[v] = roi_local[i];
+      roi_tmp[i + rank] = roi_local[axes.size() + i];
     }
-    return roi_temp;
+    return roi_tmp;
   }
 
   return roi_local;
