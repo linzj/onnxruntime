@@ -4,6 +4,20 @@
 
 namespace onnxruntime {
 namespace webgpu {
+namespace {
+// Helper function that mimics the TypeScript sortBasedOnPerm logic
+inline std::vector<int64_t> SortBasedOnPerm(const std::vector<int64_t>& a, const std::vector<size_t>& perm) {
+  if (!perm.empty()) {
+    std::vector<int64_t> result(a.size());
+    for (size_t i = 0; i < perm.size(); i++) {
+      result[i] = a[perm[i]];
+    }
+    return result;
+  } else {
+    return std::vector<int64_t>(a.rbegin(), a.rend());
+  }
+}
+}  // namespace
 
 // DepthToSpace operator declarations
 ONNX_OPERATOR_VERSIONED_KERNEL_EX(
@@ -145,7 +159,8 @@ Status DepthToSpace::ComputeInternal(ComputeContext& context) const {
 
   // Configure inputs/outputs
   program->AddInputs({{input_tensor, ProgramTensorMetadataDependency::TypeAndRank, TensorShape(reshaped_shape), components}});
-  program->AddOutput({output, ProgramTensorMetadataDependency::None, TensorShape(reshaped_shape), components});
+  const auto shape_after_perm = SortBasedOnPerm(reshaped_shape, perm);
+  program->AddOutput({output, ProgramTensorMetadataDependency::None, TensorShape(shape_after_perm), components});
 
   // Set dispatch size
   program->SetDispatchGroupSize(
