@@ -30,22 +30,25 @@ namespace onnxruntime {
 namespace webgpu {
 #if !defined(NDEBUG)
 bool should_capture_output_next = false;
+constexpr bool kCaptureBufferFirstMet = true;
 namespace {
+size_t saved_buffer_count = 0;
+
 void SaveBuffer(const wgpu::Device& device, const wgpu::Instance& instance,
                 const wgpu::Buffer& source_buffer, std::string_view file_name) {
-  // 创建临时缓冲区用于映射
+  // Create a temporary buffer for mapping
   wgpu::BufferDescriptor temp_buffer_desc;
   temp_buffer_desc.label = (std::string("TempDownloadBuffer") + file_name.data()).c_str();
   temp_buffer_desc.size = source_buffer.GetSize();
   temp_buffer_desc.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead;
   wgpu::Buffer temp_buffer = device.CreateBuffer(&temp_buffer_desc);
 
-  // 创建命令编码器并复制数据
+  // Create command encoder and copy data
   wgpu::CommandEncoder encoder = device.CreateCommandEncoder();
   encoder.CopyBufferToBuffer(source_buffer, 0, temp_buffer, 0, source_buffer.GetSize());
   wgpu::CommandBuffer commands = encoder.Finish();
 
-  // 提交命令并等待完成
+  // Submit command and wait for completion
   auto queue = device.GetQueue();
   queue.Submit(1, &commands);
 
@@ -56,7 +59,7 @@ void SaveBuffer(const wgpu::Device& device, const wgpu::Instance& instance,
   };
   instance.WaitAny(queue.OnSubmittedWorkDone(wgpu::CallbackMode::WaitAnyOnly, wait_lambda), UINT64_MAX);
 
-  // 映射临时缓冲区
+  // Map the temporary buffer
   instance.WaitAny(temp_buffer.MapAsync(wgpu::MapMode::Read, 0, temp_buffer.GetSize(),
                                         wgpu::CallbackMode::WaitAnyOnly,
                                         [](wgpu::MapAsyncStatus status, wgpu::StringView message) {
@@ -66,7 +69,7 @@ void SaveBuffer(const wgpu::Device& device, const wgpu::Instance& instance,
                                         }),
                    UINT64_MAX);
 
-  // 写入文件
+  // Write to file
   const void* data = temp_buffer.GetConstMappedRange(0, temp_buffer.GetSize());
   std::ofstream file(file_name.data(), std::ios::binary);
   if (!file.is_open()) {
@@ -87,11 +90,11 @@ void DownloadOutputDatas(const wgpu::Instance& instance, const wgpu::Device& dev
       ORT_THROW("Unsupported data type for output tensor: ", output.tensor->DataType());
     }
 
-    // 获取源缓冲区
+    // Retrieve the source buffer
     WGPUBuffer source = reinterpret_cast<WGPUBuffer>(output.tensor->MutableDataRaw());
-    wgpu::Buffer source_buffer = wgpu::Buffer::Acquire(source);
+    wgpu::Buffer source_buffer = wgpu::Buffer(source);
 
-    // 生成文件名并保存
+    // Generate file name and save
     std::stringstream ss;
     const auto& shape = output.tensor->Shape();
     for (size_t i = 0; i < shape.NumDimensions(); ++i) {
@@ -118,11 +121,11 @@ void DownloadInputDatas(const wgpu::Instance& instance, const wgpu::Device& devi
       ORT_THROW("Unsupported data type for input tensor: ", input.tensor->DataType());
     }
 
-    // 获取源缓冲区（注意使用const数据访问）
+    // Retrieve the source buffer (use const data access)
     WGPUBuffer source = reinterpret_cast<WGPUBuffer>(const_cast<void*>(input.tensor->DataRaw()));
-    wgpu::Buffer source_buffer = wgpu::Buffer::Acquire(source);
+    wgpu::Buffer source_buffer = wgpu::Buffer(source);
 
-    // 生成文件名并保存
+    // Generate file name and save
     std::stringstream ss;
     const auto& shape = input.tensor->Shape();
     for (size_t i = 0; i < shape.NumDimensions(); ++i) {
@@ -154,6 +157,17 @@ void DownloadUniformBuffer(const wgpu::Instance& instance, const wgpu::Device& d
 
   // 调用 SaveBuffer 保存缓冲区
   SaveBuffer(device, instance, uniform_buffer, file_name);
+}
+
+std::unordered_set<std::string> program_has_met;
+
+bool IsProgramFirstMet(std::string_view program_cache_key) {
+  auto it = program_has_met.find(std::string(program_cache_key));
+  if (it == program_has_met.end()) {
+    program_has_met.emplace(std::string(program_cache_key));
+    return true;
+  }
+  return false;
 }
 }  // namespace
 #endif
@@ -535,13 +549,18 @@ Status WebGpuContext::Run(ComputeContext& context, const ProgramBase& program) {
   compute_pass_encoder.SetBindGroup(0, bind_group);
   compute_pass_encoder.DispatchWorkgroups(x, y, z);
 #if !defined(NDEBUG)
+  if (kCaptureBufferFirstMet && IsProgramFirstMet(key)) {
+    should_capture_output_next = true;
+  }
+
   if (should_capture_output_next) {
     should_capture_output_next = false;
     Flush();
     num_pending_dispatches_ = 0;
-    DownloadInputDatas(instance_, device_, inputs, program.Name());
-    DownloadOutputDatas(instance_, device_, outputs, program.Name());
-    DownloadUniformBuffer(instance_, device_, uniform_buffer, program.Name());
+    size_t save_index = saved_buffer_count++;
+    DownloadInputDatas(instance_, device_, inputs, program.Name() + std::to_string(save_index));
+    DownloadOutputDatas(instance_, device_, outputs, program.Name() + std::to_string(save_index));
+    DownloadUniformBuffer(instance_, device_, uniform_buffer, program.Name() + std::to_string(save_index));
   }
 #endif
 
