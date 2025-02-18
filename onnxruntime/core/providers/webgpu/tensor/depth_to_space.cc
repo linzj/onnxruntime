@@ -20,12 +20,12 @@ inline std::vector<int64_t> SortBasedOnPerm(const std::vector<int64_t>& a, const
 }  // namespace
 
 // DepthToSpace operator declarations
-ONNX_OPERATOR_VERSIONED_KERNEL_EX(
+ONNX_OPERATOR_KERNEL_EX(
     DepthToSpace,
-    kOnnxDomain,
-    11, 12,
+    kMSInternalNHWCDomain,
+    13,
     kWebGpuExecutionProvider,
-    (*KernelDefBuilder::Create())
+    KernelDefBuilder()
         .TypeConstraint("T", WebGpuSupportedNumberTypes()),
     DepthToSpace);
 
@@ -34,7 +34,25 @@ ONNX_OPERATOR_KERNEL_EX(
     kOnnxDomain,
     13,
     kWebGpuExecutionProvider,
-    (*KernelDefBuilder::Create())
+    KernelDefBuilder()
+        .TypeConstraint("T", WebGpuSupportedNumberTypes()),
+    DepthToSpace);
+
+ONNX_OPERATOR_VERSIONED_KERNEL_EX(
+    DepthToSpace,
+    kMSInternalNHWCDomain,
+    11, 12,
+    kWebGpuExecutionProvider,
+    KernelDefBuilder()
+        .TypeConstraint("T", WebGpuSupportedNumberTypes()),
+    DepthToSpace);
+
+ONNX_OPERATOR_VERSIONED_KERNEL_EX(
+    DepthToSpace,
+    kOnnxDomain,
+    11, 12,
+    kWebGpuExecutionProvider,
+    KernelDefBuilder()
         .TypeConstraint("T", WebGpuSupportedNumberTypes()),
     DepthToSpace);
 
@@ -46,15 +64,9 @@ DepthToSpace::DepthToSpace(const OpKernelInfo& info) : WebGpuKernel(info) {
 
   // Get mode attribute (default to "DCR")
   ORT_THROW_IF_ERROR(info.GetAttr("mode", &attributes_.mode));
-#if 0
-  attributes_.mode = info.GetAttrOrDefault("mode", std::string("DCR"));
-  auto format = info.GetAttrOrDefault<std::string>("format", "NCHW");
-  attributes_.nchw = (format == "NCHW");
-#endif
 
   // Get format attribute (default to NCHW)
-  std::string format = info.GetAttrOrDefault("format", std::string("NCHW"));
-  attributes_.nchw = (format == "NCHW");
+  attributes_.nchw = (info.GetKernelDef().Domain() != kMSInternalNHWCDomain);
 }
 
 void DepthToSpace::ValidateInputs(const ComputeContext& context) const {
@@ -130,19 +142,16 @@ Status DepthToSpace::ComputeInternal(ComputeContext& context) const {
   const auto& dims = input_shape.GetDims();
   const int64_t blocksize = attributes_.blocksize;
 
-  int components;
   if (attributes_.nchw) {
     output_shape[0] = dims[0];                            // N
     output_shape[1] = dims[1] / (blocksize * blocksize);  // C
     output_shape[2] = dims[2] * blocksize;                // H
     output_shape[3] = dims[3] * blocksize;                // W
-    components = 1;
   } else {
     output_shape[0] = dims[0];                            // N
     output_shape[1] = dims[1] * blocksize;                // H
     output_shape[2] = dims[2] * blocksize;                // W
     output_shape[3] = dims[3] / (blocksize * blocksize);  // C
-    components = 4;
   }
 
   // Create and setup the program
@@ -158,9 +167,9 @@ Status DepthToSpace::ComputeInternal(ComputeContext& context) const {
   auto* output = context.Output(0, TensorShape(output_shape));
 
   // Configure inputs/outputs
-  program->AddInputs({{input_tensor, ProgramTensorMetadataDependency::TypeAndRank, TensorShape(reshaped_shape), components}});
+  program->AddInputs({{input_tensor, ProgramTensorMetadataDependency::TypeAndRank, TensorShape(reshaped_shape), 1}});
   const auto shape_after_perm = SortBasedOnPerm(reshaped_shape, perm);
-  program->AddOutput({output, ProgramTensorMetadataDependency::None, TensorShape(shape_after_perm), components});
+  program->AddOutput({output, ProgramTensorMetadataDependency::None, TensorShape(shape_after_perm), 1});
 
   // Set dispatch size
   program->SetDispatchGroupSize(

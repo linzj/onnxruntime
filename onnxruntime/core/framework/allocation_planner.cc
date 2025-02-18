@@ -481,11 +481,13 @@ class PlannerImpl {
       if (utils::HasDimValue(val1) && utils::HasDimValue(val2) &&
           (val1.dim_value() == val2.dim_value()))
         continue;  // same known dimension
+#if 0
       if (utils::HasDimParam(val1) && utils::HasDimParam(val2)) {
         const auto& val1_param = val1.dim_param();
         if (val1_param == val2.dim_param() && !val1_param.empty())
           continue;  // same unknown dimension
       }
+#endif
       return false;
     }
     return true;

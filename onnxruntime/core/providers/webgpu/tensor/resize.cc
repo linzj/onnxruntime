@@ -24,40 +24,55 @@ struct hash<std::vector<T>> {
 namespace onnxruntime {
 namespace webgpu {
 
-#define WEBGPU_RESIZE_VERSIONED_KERNEL(start, end)            \
-  ONNX_OPERATOR_VERSIONED_KERNEL_EX(                          \
-      Resize,                                                 \
-      kOnnxDomain,                                            \
-      start,                                                  \
-      end,                                                    \
-      kWebGpuExecutionProvider,                               \
-      (*KernelDefBuilder::Create())                           \
-          .TypeConstraint("T1", WebGpuSupportedNumberTypes()) \
-          .TypeConstraint("T2", WebGpuSupportedNumberTypes()) \
-          .InputMemoryType(OrtMemTypeCPU, 1)                  \
-          .InputMemoryType(OrtMemTypeCPU, 2)                  \
-          .InputMemoryType(OrtMemTypeCPU, 3),                 \
+#define REGISTER_RESIZE_VERSIONED_10_10_KERNEL(domain)       \
+  ONNX_OPERATOR_VERSIONED_KERNEL_EX(                         \
+      Resize,                                                \
+      domain,                                                \
+      10, 10,                                                \
+      kWebGpuExecutionProvider,                              \
+      (*KernelDefBuilder::Create())                          \
+          .InputMemoryType(OrtMemTypeCPUInput, 1)            \
+          .TypeConstraint("T", WebGpuSupportedFloatTypes()), \
       Resize);
 
-#define WEBGPU_RESIZE_KERNEL(version)                         \
+#define REGISTER_RESIZE_VERSIONED_KERNEL(domain, sinceVersion, endVerion) \
+  ONNX_OPERATOR_VERSIONED_KERNEL_EX(                                      \
+      Resize,                                                             \
+      domain,                                                             \
+      sinceVersion, endVerion,                                            \
+      kWebGpuExecutionProvider,                                           \
+      (*KernelDefBuilder::Create())                                       \
+          .InputMemoryType(OrtMemTypeCPUInput, 1)                         \
+          .InputMemoryType(OrtMemTypeCPUInput, 2)                         \
+          .InputMemoryType(OrtMemTypeCPUInput, 3)                         \
+          .TypeConstraint("T1", WebGpuSupportedFloatTypes())              \
+          .TypeConstraint("T2", WebGpuSupportedFloatTypes()),             \
+      Resize);
+
+#define REGISTER_RESIZE_KERNEL(domain, sinceVersion)          \
   ONNX_OPERATOR_KERNEL_EX(                                    \
       Resize,                                                 \
-      kOnnxDomain,                                            \
-      version,                                                \
+      domain,                                                 \
+      sinceVersion,                                           \
       kWebGpuExecutionProvider,                               \
       (*KernelDefBuilder::Create())                           \
-          .TypeConstraint("T1", WebGpuSupportedNumberTypes()) \
-          .TypeConstraint("T2", WebGpuSupportedNumberTypes()) \
-          .InputMemoryType(OrtMemTypeCPU, 1)                  \
-          .InputMemoryType(OrtMemTypeCPU, 2)                  \
-          .InputMemoryType(OrtMemTypeCPU, 3),                 \
+          .InputMemoryType(OrtMemTypeCPUInput, 1)             \
+          .InputMemoryType(OrtMemTypeCPUInput, 2)             \
+          .InputMemoryType(OrtMemTypeCPUInput, 3)             \
+          .TypeConstraint("T1", WebGpuSupportedFloatTypes())  \
+          .TypeConstraint("T2", WebGpuSupportedFloatTypes()), \
       Resize);
 
-WEBGPU_RESIZE_VERSIONED_KERNEL(10, 10)
-WEBGPU_RESIZE_VERSIONED_KERNEL(11, 12)
-WEBGPU_RESIZE_VERSIONED_KERNEL(13, 17)
-WEBGPU_RESIZE_VERSIONED_KERNEL(18, 18)
-WEBGPU_RESIZE_KERNEL(19)
+#define REGISTER_RESIZE_KERNEL_DOMAIN(domain)       \
+  REGISTER_RESIZE_VERSIONED_KERNEL(domain, 11, 12); \
+  REGISTER_RESIZE_VERSIONED_KERNEL(domain, 13, 17); \
+  REGISTER_RESIZE_VERSIONED_KERNEL(domain, 18, 18); \
+  REGISTER_RESIZE_KERNEL(domain, 19);
+
+REGISTER_RESIZE_VERSIONED_10_10_KERNEL(kOnnxDomain);
+REGISTER_RESIZE_VERSIONED_10_10_KERNEL(kMSInternalNHWCDomain);
+REGISTER_RESIZE_KERNEL_DOMAIN(kOnnxDomain);
+REGISTER_RESIZE_KERNEL_DOMAIN(kMSInternalNHWCDomain);
 
 namespace {
 std::string SetChannelAndBatchIndices(
