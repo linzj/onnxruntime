@@ -809,10 +809,10 @@ std::string WriteDataToSubAVec4SnippetImpl(bool transpose_a, const ShaderIndices
   std::ostringstream code;
   if (transpose_a) {
     code << "mm_Asub[inputRow][inputCol] = mm_readA(batch, kStart + inputRow, "
-         << "globalRowStart / innerElementSize + inputCol" << ((batch_dims && batch_dims->Rank() > 0) ? ", batchIndices" : "") << ");";
+         << "globalRowStart / innerElementSize + inputCol" << (batch_dims ? ", batchIndices" : "") << ");";
   } else {
-    code << "mm_Asub[inputRow][inputCol] = mm_readA(batch, globalRowStart + inputRow, "
-         << "kStart / innerElementSize + inputCol" << ((batch_dims && batch_dims->Rank() > 0) ? ", batchIndices" : "") << ");";
+    code << "mm_Asub[inputRow][inputCol] = mm_readA(batch, globalRow + innerRow, "
+         << "kStart / innerElementSize + inputCol" << (batch_dims ? ", batchIndices" : "") << ");";
   }
   return code.str();
 }
@@ -855,20 +855,20 @@ std::string CalculateResultSnippet(bool transpose_a, uint32_t inner_element_size
 
     code << "        for (var i = 0; i < rowPerThread; i = i + 1) {\n"
          << "          acc[i] = fma(BCached0, ACached0[i], acc[i]);\n"
-         << "          acc[i] = fma(BCached0, ACached1[i], acc[i]);\n"
-         << "          acc[i] = fma(BCached0, ACached2[i], acc[i]);\n";
+         << "          acc[i] = fma(BCached1, ACached1[i], acc[i]);\n"
+         << "          acc[i] = fma(BCached2, ACached2[i], acc[i]);\n";
     if (inner_element_size != 3) {
-      code << "          acc[i] = fma(BCached0, ACached3[i], acc[i]);\n";
+      code << "          acc[i] = fma(BCached3, ACached3[i], acc[i]);\n";
     }
     code << "        }\n";
   } else {
     code << "        for (var i = 0; i < rowPerThread; i = i + 1) {\n"
          << "          let ACached = mm_Asub[tileRow + i][k];\n"
          << "          acc[i] = BCached0 * ACached.x + acc[i];\n"
-         << "          acc[i] = BCached0 * ACached.y + acc[i];\n"
-         << "          acc[i] = BCached0 * ACached.z + acc[i];\n";
+         << "          acc[i] = BCached1 * ACached.y + acc[i];\n"
+         << "          acc[i] = BCached2 * ACached.z + acc[i];\n";
     if (inner_element_size != 3) {
-      code << "          acc[i] = BCached0 * ACached.w + acc[i];\n";
+      code << "          acc[i] = BCached3 * ACached.w + acc[i];\n";
     }
     code << "        }\n";
   }
@@ -904,11 +904,11 @@ void GenerateMatMulPackedVec4Code(OStringStream& additional_implementation,
       << "var<workgroup> mm_Asub: array<array<vec" << inner_element_size
       << "<" << input_value_type << ">, " << tile_a_width / inner_element_size << ">, " << tile_a_height << ">;\n"
       << "var<workgroup> mm_Bsub: array<array<vec4<f32>, "
-      << tile_b_outer / elements_per_thread[0] << ">, " << 32 << ">;\n\n"
+      << tile_b_outer / elements_per_thread[0] << ">, " << tile_inner << ">;\n\n"
       << "const rowPerThread = " << elements_per_thread[1] << ";\n"
       << "const colPerThread = " << elements_per_thread[0] << ";\n"
       << "const innerElementSize = " << inner_element_size << ";\n"
-      << "const tileInner = " << 32 << ";\n\n";
+      << "const tileInner = " << tile_inner << ";\n\n";
 
   // Generate main computation
   main_function_body
