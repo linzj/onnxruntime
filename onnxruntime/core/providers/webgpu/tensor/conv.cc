@@ -1047,17 +1047,25 @@ void GenerateMatMulPackedCode(OStringStream& additional_implementation,
       << "}\n";
 }
 
-std::string GenerateUtilFunctions(const std::string& stride_str_in, bool is_vec4) {
+std::string GenerateUtilFunctions(const std::string& stride_str_in, bool is_input_vec4, bool is_output_vec4) {
   std::ostringstream code;
   std::string_view stride_str = stride_str_in;
   std::string stride_str_vec4_init;
-  if (is_vec4) {
+  std::string shape_str_init;
+  shape_str_init = "  let shape_local = shape;\n";
+  if (is_output_vec4) {
     stride_str_vec4_init = std::string("  let stride = vec3<i32>(") + std::string(stride_str) + ") * 4;\n";
     stride_str = "stride";
   }
+
+  if (is_input_vec4) {
+    shape_str_init = "  let shape_local = vec4<i32>(shape.x, shape.y, shape.z, shape.w *4);\n";
+  }
+
   code << "fn getIndexFromCoords4D(coords : vec4<i32>, shape : vec4<i32>) -> i32 {\n"
+       << shape_str_init
        << "  return dot(coords, vec4<i32>(\n"
-       << "      shape.y * shape.z * shape.w, shape.z * shape.w, shape.w, 1));\n"
+       << "      shape_local.y * shape_local.z * shape_local.w, shape_local.z * shape_local.w, shape_local.w , 1));\n"
        << "}\n\n"
        << "fn getOutputIndexFromCoords(coords : vec4<i32>) -> i32 {\n"
        << stride_str_vec4_init
@@ -1924,7 +1932,7 @@ Status Conv2DMatMulProgram::GenerateShaderCode(ShaderHelper& shader) const {
 
   // Fill in declared function here.
   shader.AdditionalImplementation()
-      << GenerateUtilFunctions("uniforms.output_stride", is_vec4)
+      << GenerateUtilFunctions("uniforms.output_stride", (attributes_.in_channels % 4 == 0), is_vec4)
       << "fn setOutputAtIndex(flatIndex : i32, value : " << "output_value_t" << ") {\n"
       << "  output[flatIndex] = value;\n"
       << "}\n\n"
