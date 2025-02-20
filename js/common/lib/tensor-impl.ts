@@ -148,6 +148,8 @@ export class Tensor implements TensorInterface {
           this.gpuTextureData = arg0.texture;
           this.downloader = arg0.download;
           this.disposer = arg0.dispose;
+          this.gpuTextureAcutalWidth = arg0.actualWidth;
+          this.gpuTextureAcutalHeight = arg0.actualHeight;
           break;
         }
         case 'gpu-buffer': {
@@ -411,6 +413,15 @@ export class Tensor implements TensorInterface {
   private gpuTextureData?: TensorTextureType;
 
   /**
+   * stores the actual width of the GPU texture resource.
+   */
+  private gpuTextureAcutalWidth?: number;
+  /**
+   * stores the actual height of the GPU texture resource.
+   */
+  private gpuTextureAcutalHeight?: number;
+
+  /**
    * stores the underlying GPU buffer when location is 'gpu-buffer'. otherwise empty.
    */
   private gpuBufferData?: TensorGpuBufferType;
@@ -458,6 +469,22 @@ export class Tensor implements TensorInterface {
       throw new Error('The data is not stored as a WebGL texture.');
     }
     return this.gpuTextureData;
+  }
+
+  get actualTextureWidth(): number {
+    this.ensureValid();
+    if (!this.gpuTextureAcutalWidth) {
+      throw new Error('The data is not stored as a WebGL texture.');
+    }
+    return this.gpuTextureAcutalWidth;
+  }
+
+  get actualTextureHeight(): number {
+    this.ensureValid();
+    if (!this.gpuTextureAcutalHeight) {
+      throw new Error('The data is not stored as a WebGL texture.');
+    }
+    return this.gpuTextureAcutalHeight;
   }
 
   get gpuBuffer(): TensorGpuBufferType {

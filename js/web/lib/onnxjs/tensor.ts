@@ -148,6 +148,10 @@ export class Tensor {
   public readonly size: number;
 
   private _strides: readonly number[];
+
+  public texture?: WebGLTexture;
+  public textureWidth?: number;
+  public textureHeight?: number;
   /**
    * get the strides for each dimension
    */

@@ -97,6 +97,10 @@ export declare namespace Env {
      */
     contextId?: 'webgl' | 'webgl2';
     /**
+    * The preset WebGL rendering context to be used by the environment.
+    */
+    presetContext?: WebGLRenderingContext;
+    /**
      * Get the WebGL rendering context.
      */
     readonly context: WebGLRenderingContext;

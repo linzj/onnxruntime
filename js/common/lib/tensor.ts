@@ -373,7 +373,7 @@ export interface TensorConstructor extends TensorFactory {
    */
   new (
     type: Tensor.Type,
-    data: Tensor.DataType | readonly number[] | readonly string[] | readonly bigint[] | readonly boolean[],
+    data: WebGLTexture | Tensor.DataType | readonly number[] | readonly string[] | readonly bigint[] | readonly boolean[],
     dims?: readonly number[],
   ): Tensor;
 

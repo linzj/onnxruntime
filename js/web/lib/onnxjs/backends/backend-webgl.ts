@@ -56,7 +56,11 @@ export class WebGLBackend implements Backend {
 
   initialize(): boolean {
     try {
-      this.glContext = createWebGLContext(this.contextId);
+      if (env.webgl.presetContext && !env.webgl.presetContext.isContextLost()) {
+        this.glContext = new WebGLContext(env.webgl.presetContext, 2);
+      } else {
+        this.glContext = createWebGLContext(this.contextId);
+      }
       if (typeof this.matmulMaxBatchSize !== 'number') {
         this.matmulMaxBatchSize = 16;
       }

@@ -157,7 +157,7 @@ export class ExecutionPlan {
           await outputTensor.getData();
         } else {
           // eslint-disable-next-line no-unused-expressions
-          outputTensor.data;
+          // outputTensor.data;
         }
         output.push(outputTensor);
       }

@@ -295,6 +295,9 @@ export class WebGLInferenceHandler implements InferenceHandler {
         ),
       texture,
     };
+    textureData.tensor.texture = texture;
+    textureData.tensor.textureWidth = layout.width;
+    textureData.tensor.textureHeight = layout.height;
     this.setTextureData(textureData.tensor.dataId, textureData, layout.isPacked);
     return textureData;
   }

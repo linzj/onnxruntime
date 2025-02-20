@@ -39,7 +39,15 @@ export class OnnxjsSessionHandler implements InferenceSessionHandler {
     const outputMap = await this.session.run(inputMap);
     const output: SessionHandler.ReturnType = {};
     outputMap.forEach((tensor, name) => {
-      output[name] = new Tensor(tensor.type, tensor.data, tensor.dims);
+      if (tensor.texture !== undefined) {
+        const dims = tensor.dims;
+        // Assume NCHW layout.
+        output[name] = Tensor.fromTexture<"float32">(tensor.texture, { width: dims[3], height: dims[2], actualWidth: tensor.textureWidth, actualHeight: tensor.textureHeight });
+      } else if (tensor.data !== undefined) {
+        output[name] = new Tensor(tensor.type, tensor.data, tensor.dims);
+      } else {
+        throw new Error('Unexpected output type');
+      }
     });
     return output;
   }

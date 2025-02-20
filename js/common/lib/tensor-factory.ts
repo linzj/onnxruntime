@@ -68,6 +68,15 @@ export interface TextureConstructorParameters<T extends Tensor.TextureDataTypes 
    * Specify the WebGL texture that holds the tensor data.
    */
   readonly texture: Tensor.TextureType;
+
+  /**
+   * The actual width of the texture in pixels.
+   */
+  readonly actualWidth?: number;
+  /**
+   * The actual height of the texture in pixels.
+   */
+  readonly actualHeight?: number;
 }
 
 /**
@@ -222,7 +231,10 @@ export interface TensorFromImageBitmapOptions
 export interface TensorFromTextureOptions<T extends Tensor.TextureDataTypes>
   extends Required<OptionsDimensions>,
     OptionsFormat,
-    GpuResourceConstructorParameters<T> /* TODO: add more */ {}
+  GpuResourceConstructorParameters<T> /* TODO: add more */ {
+  actualWidth?: number;
+  actualHeight?: number;
+}
 
 export interface TensorFromGpuBufferOptions<T extends Tensor.GpuBufferDataTypes>
   extends Pick<Tensor, 'dims'>,
