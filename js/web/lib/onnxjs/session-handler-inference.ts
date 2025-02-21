@@ -12,7 +12,7 @@ export class OnnxjsSessionHandler implements InferenceSessionHandler {
     this.outputNames = this.session.outputNames;
   }
 
-  async dispose(): Promise<void> {}
+  async dispose(): Promise<void> { }
   inputNames: readonly string[];
   outputNames: readonly string[];
   async run(
@@ -24,16 +24,35 @@ export class OnnxjsSessionHandler implements InferenceSessionHandler {
     for (const name in feeds) {
       if (Object.hasOwnProperty.call(feeds, name)) {
         const feed = feeds[name];
-        inputMap.set(
-          name,
-          new OnnxjsTensor(
+        if (feed.location === 'cpu') {
+          inputMap.set(
+            name,
+            new OnnxjsTensor(
+              feed.dims,
+              feed.type as OnnxjsTensor.DataType,
+              undefined,
+              undefined,
+              feed.data as OnnxjsTensor.NumberType,
+            ),
+          );
+        } else if (feed.location === 'texture') {
+          const onnxjsTensor = new OnnxjsTensor(
             feed.dims,
             feed.type as OnnxjsTensor.DataType,
+            () => {
+              throw new Error('Not implemented')
+            },
             undefined,
             undefined,
-            feed.data as OnnxjsTensor.NumberType,
-          ),
-        );
+          );
+          onnxjsTensor.texture = feed.texture;
+          onnxjsTensor.textureWidth = feed.actualTextureWidth;
+          onnxjsTensor.textureHeight = feed.actualTextureHeight;
+          inputMap.set(
+            name,
+            onnxjsTensor,
+          );
+        }
       }
     }
     const outputMap = await this.session.run(inputMap);

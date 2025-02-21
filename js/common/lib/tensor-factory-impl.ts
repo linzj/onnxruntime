@@ -294,9 +294,9 @@ export const tensorFromTexture = <T extends TensorInterface.TextureDataTypes>(
   texture: TensorInterface.TextureType,
   options: TensorFromTextureOptions<T>,
 ): Tensor => {
-  const { width, height, download, dispose, actualWidth, actualHeight } = options;
+  const { width, height, download, dispose, actualWidth, actualHeight, inputDims } = options;
   // Always assume RGBAF32. TODO: support different texture format
-  const dims = [1, height, width, 4];
+  const dims = inputDims ? inputDims : [1, height, width, 4];
   return new Tensor({ location: 'texture', type: 'float32', texture, dims, download, dispose, actualWidth, actualHeight });
 };
 

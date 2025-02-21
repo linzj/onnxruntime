@@ -5,6 +5,7 @@ import { ShapeUtil } from '../../util';
 
 import { TextureLayoutStrategy, WidthHeightPrefs } from './texture-layout-strategy';
 import { TextureLayout, TextureType } from './types';
+import { Tensor as OnnxjsTensor } from '../../tensor';
 
 export const createTextureLayoutFromTextureType = (
   textureLayoutStrategy: TextureLayoutStrategy,
@@ -24,6 +25,21 @@ export const createTextureLayoutFromTextureType = (
     reverseWH,
     breakAxis,
   });
+};
+
+export const createTextureLayoutFromOnnxjsTensor = (
+  tensor: OnnxjsTensor,
+): TextureLayout => {
+  return {
+    width: tensor.textureWidth,
+    height: tensor.textureHeight,
+    channels: 1,
+    shape: tensor.dims,
+    strides: ShapeUtil.computeStrides(tensor.dims),
+    unpackedShape: tensor.dims,
+    isPacked: false,
+    reversedWH: true,
+  } as TextureLayout
 };
 
 export const calculateTextureWidthAndHeight = (

@@ -16,6 +16,7 @@ import {
   calculateTextureWidthAndHeight,
   createTextureLayoutFromShape,
   createTextureLayoutFromTextureType,
+  createTextureLayoutFromOnnxjsTensor,
 } from './texture-layout';
 import { Artifact, ProgramInfo, ProgramInfoLoader, TextureData, TextureLayout, TextureType } from './types';
 
@@ -133,6 +134,13 @@ export class WebGLInferenceHandler implements InferenceHandler {
           return this.unpack(td);
         }
       }
+    }
+
+    if (!td && tensor.texture) {
+      const layout = createTextureLayoutFromOnnxjsTensor(tensor);
+      const unpackedTextureData = this.createTextureDataFromTexture(layout, tensor.type, tensor.texture, tensor);
+      unpackedTextureData.external = true;
+      td = this.pack(unpackedTextureData);
     }
 
     if (!td) {

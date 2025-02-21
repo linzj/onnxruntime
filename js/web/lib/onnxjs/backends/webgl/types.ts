@@ -37,6 +37,7 @@ export interface TextureLayout {
 export interface TextureData extends TextureLayout {
   tensor: Tensor;
   texture: WebGLTexture;
+  external?: boolean;
 }
 
 export enum TextureType {

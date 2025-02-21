@@ -140,6 +140,9 @@ export class TextureManager {
     });
   }
   releaseTexture(textureData: TextureData, deleteTexture?: boolean): void {
+    if (textureData.external) {
+      return;
+    }
     let key: string | undefined;
     if (this.config.reuseTextures) {
       key = this.textureLookup.get(textureData.texture);

@@ -36,6 +36,23 @@ interface TypedTensorBase<T extends Tensor.Type> {
    * If the data is not on GPU as WebGL texture, throw error.
    */
   readonly texture: Tensor.TextureType;
+
+  /**
+   * The actual width of the underlying texture that holds the tensor data.
+   *
+   * If the texture dimensions differ from the logical dimensions,
+   * this value reflects the actual GPU texture width.
+   */
+  readonly actualTextureWidth: number;
+
+  /**
+   * The actual height of the underlying texture that holds the tensor data.
+   *
+   * If the texture dimensions differ from the logical dimensions,
+   * this value reflects the actual GPU texture height.
+   */
+  readonly actualTextureHeight: number;
+
   /**
    * Get the WebGPU buffer that holds the tensor data.
    *

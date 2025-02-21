@@ -234,6 +234,7 @@ export interface TensorFromTextureOptions<T extends Tensor.TextureDataTypes>
   GpuResourceConstructorParameters<T> /* TODO: add more */ {
   actualWidth?: number;
   actualHeight?: number;
+  inputDims?: number[];
 }
 
 export interface TensorFromGpuBufferOptions<T extends Tensor.GpuBufferDataTypes>
