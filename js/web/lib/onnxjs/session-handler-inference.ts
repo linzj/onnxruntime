@@ -12,7 +12,7 @@ export class OnnxjsSessionHandler implements InferenceSessionHandler {
     this.outputNames = this.session.outputNames;
   }
 
-  async dispose(): Promise<void> { }
+  async dispose(): Promise<void> {}
   inputNames: readonly string[];
   outputNames: readonly string[];
   async run(
