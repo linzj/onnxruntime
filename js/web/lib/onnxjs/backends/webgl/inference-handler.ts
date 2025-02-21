@@ -140,7 +140,12 @@ export class WebGLInferenceHandler implements InferenceHandler {
       const layout = createTextureLayoutFromOnnxjsTensor(tensor);
       const unpackedTextureData = this.createTextureDataFromTexture(layout, tensor.type, tensor.texture, tensor);
       unpackedTextureData.external = true;
-      td = this.pack(unpackedTextureData);
+
+      if (textureType === TextureType.packed) {
+        td = this.pack(unpackedTextureData);
+      } else {
+        td = unpackedTextureData;
+      }
     }
 
     if (!td) {
