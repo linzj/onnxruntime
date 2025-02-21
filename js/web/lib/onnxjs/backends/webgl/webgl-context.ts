@@ -183,6 +183,7 @@ export class WebGLContext {
   }
   setVertexAttributes(positionHandle: number, textureCoordHandle: number): void {
     const gl = this.gl;
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.vertexbuffer);
     gl.vertexAttribPointer(positionHandle, 3, gl.FLOAT, false, 20, 0);
     gl.enableVertexAttribArray(positionHandle);
     if (textureCoordHandle !== -1) {
