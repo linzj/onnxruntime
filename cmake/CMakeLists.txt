@@ -1208,6 +1208,7 @@ function(onnxruntime_add_shared_library target_name)
         target_compile_definitions(${target_name} PRIVATE VER_BUILD=${VERSION_BUILD_PART})
         target_compile_definitions(${target_name} PRIVATE VER_PRIVATE=${VERSION_PRIVATE_PART})
         target_compile_definitions(${target_name} PRIVATE VER_STRING=\"${VERSION_STRING}\")
+        target_link_libraries(${target_name} PRIVATE delayimp.lib)
   endif()
 endfunction()
 

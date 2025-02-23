@@ -67,8 +67,8 @@ uint32_t GetMaxComponents(int64_t size) {
 Status ParseInternalActivationAttributes(const OpKernelInfo& info, InternalActivationAttributes& attrib) {
   Status status;
   std::string activation_str;
-  constexpr const float kMIN_CLIP = -3.4028234663852886e38;
-  constexpr const float kMAX_CLIP = 3.4028234663852886e38;
+  constexpr const float kMIN_CLIP = -3.4028234663852886e38f;
+  constexpr const float kMAX_CLIP = 3.4028234663852886e38f;
 
   status = info.GetAttr<std::string>("activation", &activation_str);
   if (!status.IsOK()) {
@@ -94,7 +94,7 @@ Status ParseInternalActivationAttributes(const OpKernelInfo& info, InternalActiv
     attrib.clipMax = activation_params[1];
   } else if (activation_str == "LeakyRelu") {
     attrib.activationAttributes = InternalActivationKind::kLeakyRelu;
-    activation_params = info.GetAttrsOrDefault<float>("activation_params", {0.01});
+    activation_params = info.GetAttrsOrDefault<float>("activation_params", {0.01f});
     attrib.alpha = activation_params[0];
   } else {
     attrib.activationAttributes = InternalActivationKind::kUndef;  // Default to Clip
@@ -112,7 +112,9 @@ ConvAttributes ParseConvAttributes(const OpKernelInfo& info) {
   // Parse dilations
   gsl::span<const int64_t> dilations_span;
   if (info.GetAttrsAsSpan("dilations", dilations_span).IsOK()) {
-    conv_attrs.dilations = std::vector<int32_t>(dilations_span.begin(), dilations_span.end());
+    for (auto dilation : dilations_span) {
+      conv_attrs.dilations.push_back(static_cast<int32_t>(dilation));
+    }
   }
 
   // Parse kernel_shape
@@ -125,7 +127,7 @@ ConvAttributes ParseConvAttributes(const OpKernelInfo& info) {
   conv_attrs.strides = info.GetAttrsOrDefault("strides", {});
 
   // Parse group (default to 1 for standard convolution)
-  conv_attrs.group = info.GetAttrOrDefault<float>("group", 1.0f);
+  conv_attrs.group = static_cast<int64_t>(info.GetAttrOrDefault<float>("group", 1.0f));
 
   // Parse nchw (default to true for NCHW format)
   conv_attrs.nchw = (info.GetKernelDef().Domain() != kMSInternalNHWCDomain);
@@ -447,7 +449,7 @@ Status RunGroupedConvProgram(
 Status RunNaiveMatmulProgram(
     ComputeContext& context,
     const std::vector<const Tensor*>& inputs,
-    const std::vector<const TensorShape>& input_shapes,
+    const std::vector<TensorShape>& input_shapes,
     const InternalActivationAttributes& activation_attributes,
     const TensorShapeVector& output_shape,
     const TensorShapeVector* reshaped_output_shape,
@@ -532,7 +534,7 @@ Status RunNaiveMatmulProgram(
 Status RunMatmulProgram(
     ComputeContext& context,
     const std::vector<const Tensor*>& inputs,
-    const std::vector<const TensorShape>& input_shapes,
+    const std::vector<TensorShape>& input_shapes,
     const InternalActivationAttributes& activation_attributes,
     const TensorShapeVector& output_shape,
     const TensorShapeVector* reshaped_output_shape,
@@ -587,7 +589,6 @@ Status RunMatmulProgram(
   program->attributes_.has_bias = (bias != nullptr);
   program->attributes_.is_channels_last = is_channels_last;
   program->attributes_.activationAttributes = activation_attributes;
-  program->attributes_.outer_dims = std::vector<uint32_t>(outer_dims.begin(), outer_dims.end());
 
   // Convert shapes to uint32
   auto to_uint32_vector = [](const TensorShape& shape) {
@@ -668,6 +669,7 @@ Status RunConv2DMatMulProgram(
     bool has_bias,
     bool sequential_access_by_threads,
     std::function<void(TensorShape&)> squeeze_output_shape_function) {
+  (void)sequential_access_by_threads;
   Tensor* output_tensor;
   // Calculate output shape and create output tensor
   output_tensor = context.Output(0, TensorShape(output_shape));
@@ -1239,6 +1241,8 @@ void Conv::CalculateOutputShape(const ComputeContext& context, const ConvAttribu
 
 // HandleConv1D - Convolution for 1D inputs (e.g., [batch_size, channels, width])
 Status Conv::HandleConv1D(ComputeContext& context, const ConvAttributes& attributes) const {
+  (void)context;
+  (void)attributes;
   // Implement the convolution logic for 1D inputs
   // You would need to write the code that actually performs the convolution
   // For example, setting up the shader or calling the relevant WebGPU method
@@ -1249,6 +1253,8 @@ Status Conv::HandleConv1D(ComputeContext& context, const ConvAttributes& attribu
 
 // HandleConv3D - Convolution for 3D inputs (e.g., [batch_size, channels, depth, height, width])
 Status Conv::HandleConv3D(ComputeContext& context, const ConvAttributes& attributes) const {
+  (void)context;
+  (void)attributes;
   // Implement the convolution logic for 3D inputs
   // Similar to Conv1D, you'd need to handle the 3D tensor data and perform
   // the convolution operation, possibly dispatching it to a WebGPU shader.
@@ -1341,7 +1347,7 @@ Status Conv::HandleConv2D(ComputeContext& context, const ConvAttributes& attribu
     TensorShapeVector x_reshaped;
     TensorShapeVector w_reshaped;
     TensorShapeVector mat_mul_output_shape;
-    std::vector<const TensorShape> mat_mul_input_shapes;
+    std::vector<TensorShape> mat_mul_input_shapes;
     std::vector<const Tensor*> mat_mul_inputs;
 
     if (is_channels_last) {

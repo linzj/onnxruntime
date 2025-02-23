@@ -155,7 +155,7 @@ ResizeAttributes ParseResizeAttributes(const OpKernelInfo& info) {
   ResizeAttributes attrs;
 
   // Parse antialias
-  attrs.antialias = info.GetAttrOrDefault("antialias", 0.0f);
+  attrs.antialias = static_cast<int>(info.GetAttrOrDefault("antialias", 0.0f));
 
   // Parse optset
   attrs.opset = info.node().SinceVersion();
@@ -188,9 +188,9 @@ ResizeAttributes ParseResizeAttributes(const OpKernelInfo& info) {
 }
 
 std::vector<float> UpdateScales(const std::vector<float>& scales, const gsl::span<const int64_t>& axes, int rank) {
-  // Validate axes
+  // Validate axes values are within bounds
   for (const auto& axis : axes) {
-    if (axis < 0 || axis >= rank) {
+    if (axis < 0 || axis >= static_cast<int64_t>(rank)) {  // Cast rank to int64_t
       ORT_THROW("Resize requires axes input values to be positive and less than rank");
     }
   }
@@ -198,7 +198,7 @@ std::vector<float> UpdateScales(const std::vector<float>& scales, const gsl::spa
   // Initialize newScales with 1.0
   std::vector<float> newScales(rank, 1.0f);
   for (size_t i = 0; i < axes.size(); ++i) {
-    newScales[axes[i]] = scales[i];
+    newScales[static_cast<size_t>(axes[i])] = scales[i];  // Cast axes[i] to size_t
   }
   return newScales;
 }
@@ -239,13 +239,13 @@ std::vector<int64_t> InitOutputShape(const gsl::span<const int64_t>& input_shape
       output_shape.insert(output_shape.end(), input_shape.begin(), input_shape.end());
 
       // Check that axes is not out of bounds
-      if (static_cast<size_t>(*std::max_element(axes.begin(), axes.end())) > input_shape.size()) {
+      if (static_cast<size_t>(*std::max_element(axes.begin(), axes.end())) >= input_shape.size()) {
         ORT_THROW("axes is out of bound");
       }
 
       // Set values in outputShape based on axes and sizes
       for (size_t i = 0; i < axes.size(); ++i) {
-        output_shape[axes[i]] = sizes[i];
+        output_shape[static_cast<size_t>(axes[i])] = sizes[i];
       }
     } else {
       // Just copy sizes into outputShape
@@ -257,7 +257,7 @@ std::vector<int64_t> InitOutputShape(const gsl::span<const int64_t>& input_shape
     } else {
       // Scale inputShape using scales and round the values
       for (size_t i = 0; i < input_shape.size(); ++i) {
-        output_shape.push_back(std::round(input_shape[i] * scales[i]));
+        output_shape.push_back(static_cast<int64_t>(std::round(static_cast<double>(input_shape[i]) * scales[i])));
       }
     }
   }
@@ -268,19 +268,18 @@ std::vector<int64_t> InitOutputShape(const gsl::span<const int64_t>& input_shape
 std::vector<int64_t> AdjustOutputShape(const gsl::span<const int64_t>& input_shape,
                                        std::vector<float>& scales,
                                        const ResizeAttributes& attributes) {
-  // Define a lambda for scale in policy based on the provided `keepAspectRatioPolicy`
-  float scale_in_policy = [&]() -> float {
+  double scale_in_policy = [&]() -> double {
     if (attributes.keepAspectRatioPolicy == KeepAspectRatioPolicy::NotLarger) {
       if (!attributes.axes.empty()) {
-        return *std::min_element(attributes.axes.begin(), attributes.axes.end(),
-                                 [&](int i, int j) { return scales[i] < scales[j]; });
+        return static_cast<double>(*std::min_element(attributes.axes.begin(), attributes.axes.end(),
+                                                     [&](auto i, auto j) { return scales[static_cast<size_t>(i)] < scales[static_cast<size_t>(j)]; }));
       } else {
         return *std::min_element(scales.begin(), scales.end());
       }
     } else if (attributes.keepAspectRatioPolicy == KeepAspectRatioPolicy::NotSmaller) {
       if (!attributes.axes.empty()) {
-        return *std::max_element(attributes.axes.begin(), attributes.axes.end(),
-                                 [&](int i, int j) { return scales[i] < scales[j]; });
+        return static_cast<double>(*std::max_element(attributes.axes.begin(), attributes.axes.end(),
+                                                     [&](auto i, auto j) { return scales[static_cast<size_t>(i)] < scales[static_cast<size_t>(j)]; }));
       } else {
         return *std::max_element(scales.begin(), scales.end());
       }
@@ -288,29 +287,26 @@ std::vector<int64_t> AdjustOutputShape(const gsl::span<const int64_t>& input_sha
       ORT_THROW("Keep aspect ratio policy ", ResizeProgram::KeepAspectRatioPolicyToWGSL(attributes.keepAspectRatioPolicy), " is not supported");
     }
   }();
-
   // Reset scales to 1.0 for all dimensions
   std::fill(scales.begin(), scales.end(), 1.0f);
 
   std::vector<int64_t> adjustedOutputShape(input_shape.begin(), input_shape.end());
 
   if (!attributes.axes.empty()) {
-    // Set scale in policy for each axis in axes
     for (size_t i = 0; i < attributes.axes.size(); ++i) {
-      scales[attributes.axes[i]] = scale_in_policy;
-      adjustedOutputShape[attributes.axes[i]] = std::round(input_shape[attributes.axes[i]] * scales[attributes.axes[i]]);
+      scales[static_cast<size_t>(attributes.axes[i])] = static_cast<float>(scale_in_policy);
+      adjustedOutputShape[static_cast<size_t>(attributes.axes[i])] =
+          static_cast<int64_t>(std::round(static_cast<double>(input_shape[attributes.axes[i]]) * scale_in_policy));
     }
   } else {
-    // Set all scales to scaleInPolicy if no axes are provided
-    std::fill(scales.begin(), scales.end(), scale_in_policy);
+    std::fill(scales.begin(), scales.end(), static_cast<float>(scale_in_policy));
     for (size_t i = 0; i < input_shape.size(); ++i) {
-      adjustedOutputShape[i] = std::round(input_shape[i] * scales[i]);
+      adjustedOutputShape[i] = static_cast<int64_t>(std::round(static_cast<double>(input_shape[i]) * scale_in_policy));
     }
   }
 
   return adjustedOutputShape;
-};
-
+}
 }  // namespace
 
 ResizeProgram::ResizeProgram() : Program("Resize") {}

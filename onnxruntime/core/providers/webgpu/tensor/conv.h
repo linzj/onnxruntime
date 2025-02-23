@@ -155,7 +155,6 @@ class MatmulProgram : public Program<MatmulProgram> {
     bool has_bias;
     bool is_channels_last;
     InternalActivationAttributes activationAttributes;
-    std::vector<uint32_t> outer_dims;
     std::vector<uint32_t> a_shape;
     std::vector<uint32_t> b_shape;
     std::array<uint32_t, 3> elements_per_thread;  // Add this

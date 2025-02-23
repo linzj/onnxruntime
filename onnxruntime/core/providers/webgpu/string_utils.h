@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <functional>
+
 #include "core/common/make_string.h"
 #include <absl/strings/internal/ostringstream.h>
 
